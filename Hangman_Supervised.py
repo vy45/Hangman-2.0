@@ -15,21 +15,23 @@ class HangmanSupervisedDataset:
     def generate_training_sample(self, word):
         """Generate a training sample from a word"""
         word = word.lower()
-        # Initialize random number of previous guesses
-        num_prev_guesses = random.randint(0, len(word) - 1)
-        guessed_letters = set()
-        
-        # Randomly select some letters to be "previously guessed"
         word_letters = set(word)
         available_letters = set('abcdefghijklmnopqrstuvwxyz') - word_letters
         
+        # Initialize random number of previous guesses (0 to len(word)-1)
+        max_guesses = min(len(word) - 1, len(available_letters))  # Ensure we don't exceed available letters
+        num_prev_guesses = random.randint(0, max_guesses)
+        guessed_letters = set()
+        
         # Add some correct and incorrect guesses
         num_correct = random.randint(0, min(num_prev_guesses, len(word_letters)))
-        num_incorrect = num_prev_guesses - num_correct
+        num_incorrect = min(num_prev_guesses - num_correct, len(available_letters))  # Ensure we don't exceed available letters
         
         if num_correct > 0:
-            guessed_letters.update(random.sample(word_letters, num_correct))
+            # Convert set to list for random.sample
+            guessed_letters.update(random.sample(list(word_letters), num_correct))
         if num_incorrect > 0:
+            # Convert set to list for random.sample
             guessed_letters.update(random.sample(list(available_letters), num_incorrect))
             
         # Create current state representation
@@ -43,6 +45,7 @@ class HangmanSupervisedDataset:
         if not remaining_letters:
             return None  # Skip if no remaining letters
         
+        # Convert set to list for random.choice
         target_letter = random.choice(list(remaining_letters))
         
         return self._create_feature_vector(current_state, guessed_letters), self._letter_to_index(target_letter)
@@ -255,3 +258,5 @@ if __name__ == "__main__":
     
     # Train model
     model = train_supervised_model(train_words, val_words) 
+
+    
