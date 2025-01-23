@@ -73,3 +73,29 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+
+# Generated data files
+p_analysis/*
+!p_analysis/validation_words.txt
+!p_analysis/summary_stats.csv
+
+# Logs and temporary files
+*.log
+wandb/
+logs/
+tmp/
+
+# Generated datasets for p-values other than 0.5
+*_p[0-9]*.[0-9]*.txt
+*_p[0-9]*.[0-9]*.csv
+!*_p0.5.txt
+!*_p0.5.csv
+
+# Model checkpoints
+checkpoints/
+*.ckpt
+*.pth
+
+# Keep specific files
+!p_analysis/validation_words.txt
+!p_analysis/summary_stats.csv

@@ -3,217 +3,360 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
 import wandb
-from typing import List, Type
+from typing import List, Type, Dict, Optional, Any, Tuple
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 import os
+import numpy as np
+import torch.nn as nn
+from tqdm import tqdm
+import time
+from dataclasses import dataclass
 
-from ..models.transformer_model import TransformerModel
-from ..models.cnn_lstm_model import CNNLSTMModel
-from ..models.gnn_model import GNNModel
-from ..models.mlp_attention_model import MLPAttentionModel
-from ..utils.benchmarking import ModelBenchmark
-from ..data.word_processor import WordProcessor
-from ..data.simulator import HangmanSimulator
+from hangman.models.transformer_model import TransformerModel
+from hangman.models.cnn_lstm_model import CNNLSTMModel
+from hangman.models.gnn_model import GNNModel
+from hangman.models.mlp_attention_model import MLPAttentionModel
+from hangman.utils.benchmarking import ModelBenchmark
+from hangman.data.word_processor import WordProcessor
+from hangman.data.simulator import HangmanSimulator
+from hangman.data.dataset import get_dataloaders, HangmanDataset, HangmanValidationDataset
+
+@dataclass
+class BenchmarkConfig:
+    """Configuration for benchmark runs"""
+    quick_mode: bool = True
+    data_percentage: float = 5.0 if quick_mode else 100.0
+    max_epochs: int = 1 if quick_mode else 100
+    batch_size: int = 32
+    patience: int = 2 if quick_mode else 10
+    log_every_n_steps: int = 10 if quick_mode else 50
+    wandb_logging: bool = True
+    max_length: int = 30
+    input_dim: int = 28
+    hidden_dim: int = 256
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    warmup_steps: int = 100
+
+    def __post_init__(self):
+        """Validate configuration after initialization"""
+        if self.quick_mode:
+            self.data_percentage = 5.0
+            self.max_epochs = 1  # Set to 1 epoch
+            self.patience = 2
+            self.log_every_n_steps = 10
+        
+        # Validate learning parameters
+        if self.learning_rate <= 0:
+            raise ValueError(f"Learning rate must be positive, got {self.learning_rate}")
+        if self.weight_decay < 0:
+            raise ValueError(f"Weight decay must be non-negative, got {self.weight_decay}")
+        if self.warmup_steps <= 0:
+            raise ValueError(f"Warmup steps must be positive, got {self.warmup_steps}")
 
 class ModelBenchmarker:
     def __init__(
         self,
+        config: BenchmarkConfig,
         model_classes: List[Type],
-        train_words: List[str],
-        val_words: List[str],
-        device: str = None,
-        batch_size: int = 64,
-        max_epochs: int = 10
+        data_dir: Path,
     ):
-        if device is None:
-            self.device = torch.device("mps" if torch.backends.mps.is_available() 
-                                     else "cuda" if torch.cuda.is_available() 
-                                     else "cpu")
-        else:
-            self.device = torch.device(device)
-            
+        """Initialize benchmarking environment
+        
+        Args:
+            config: Benchmark configuration
+            model_classes: List of model classes to benchmark
+            data_dir: Directory containing dataset
+        """
+        # Initialize configuration
+        self.config = config
         self.model_classes = model_classes
-        self.train_words = train_words
-        self.val_words = val_words
-        self.batch_size = batch_size
-        self.max_epochs = max_epochs
+        self.data_dir = Path(data_dir)
         
-        # Initialize data processing
-        self.word_processor = WordProcessor(train_words)
-        self.simulator = HangmanSimulator(self.word_processor)
+        # Initialize tracking
+        self.results: Dict[str, Dict[str, Any]] = {}
+        self.start_time: float = time.time()
         
-        # Results storage
-        self.benchmark_results = {}
-        self.training_results = {}
+        # Initialize data
+        self.train_loader: Optional[DataLoader] = None
+        self.val_loader: Optional[DataLoader] = None
         
-    def run_performance_benchmarks(self):
-        """Run performance benchmarks for all models"""
-        print("\nRunning Performance Benchmarks...")
+        # Initialize wandb
+        self.wandb_run: Optional[Any] = None
         
+        # Validate setup
+        self._validate_environment()
+        
+    def _validate_environment(self) -> None:
+        """Validate all required components are available"""
+        if not self.data_dir.exists():
+            raise FileNotFoundError(f"Data directory not found: {self.data_dir}")
+        
+        # Check CUDA availability
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+        
+        # Validate model classes
         for model_class in self.model_classes:
-            print(f"\nBenchmarking {model_class.__name__}...")
-            benchmark = ModelBenchmark(model_class, self.device)
-            results = benchmark.run_benchmark(batch_size=self.batch_size)
-            self.benchmark_results[model_class.__name__] = results
-            
-            print(f"Results for {model_class.__name__}:")
-            print(f"- Inference time (mean): {results['inference_mean_ms']:.2f}ms")
-            print(f"- Memory impact: {results['memory_impact_cpu_memory_mb']:.2f}MB")
-            if 'memory_impact_gpu_memory_mb' in results:
-                print(f"- GPU Memory impact: {results['memory_impact_gpu_memory_mb']:.2f}MB")
-                
-    def train_and_evaluate(self, project_name: str = "hangman-benchmarks"):
-        """Train and evaluate all models"""
-        print("\nTraining and Evaluating Models...")
-        
-        for model_class in self.model_classes:
-            model_name = model_class.__name__
-            print(f"\nTraining {model_name}...")
-            
-            # Initialize wandb logger
-            wandb_logger = WandbLogger(
-                project=project_name,
-                name=model_name,
-                log_model=True
-            )
-            
-            # Initialize callbacks
-            callbacks = [
-                ModelCheckpoint(
-                    monitor='val_loss',
-                    dirpath=f'checkpoints/{model_name}',
-                    filename='{epoch}-{val_loss:.2f}',
-                    save_top_k=1,
-                    mode='min'
-                ),
-                EarlyStopping(
-                    monitor='val_loss',
-                    patience=3,
-                    mode='min'
-                )
-            ]
-            
-            # Initialize trainer
-            trainer = pl.Trainer(
-                max_epochs=self.max_epochs,
-                accelerator='auto',
-                devices=1,
-                logger=wandb_logger,
-                callbacks=callbacks,
-                enable_progress_bar=True
-            )
-            
-            # Initialize model with data
-            model = model_class()
-            model.train_words = self.train_words  # Add training data
-            model.val_words = self.val_words      # Add validation data
-            
-            # Train model
-            trainer.fit(model)
-            
-            # Store results
-            self.training_results[model_name] = {
-                'best_val_loss': trainer.callback_metrics.get('val_loss', float('inf')).item(),
-                'best_val_accuracy': trainer.callback_metrics.get('val_accuracy', 0.0).item(),
-                'epochs_trained': trainer.current_epoch + 1
-            }
-            
-            wandb.finish()
-            
-    def plot_results(self, save_dir: str = 'benchmark_results'):
-        """Plot benchmark results"""
-        Path(save_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Performance metrics plot
-        perf_data = pd.DataFrame(self.benchmark_results).T
-        plt.figure(figsize=(15, 10))
-        
-        # Inference time
-        plt.subplot(2, 2, 1)
-        sns.barplot(data=perf_data, y=perf_data.index, x='inference_mean_ms')
-        plt.title('Inference Time (ms)')
-        
-        # Memory usage
-        plt.subplot(2, 2, 2)
-        sns.barplot(data=perf_data, y=perf_data.index, x='memory_impact_cpu_memory_mb')
-        plt.title('CPU Memory Impact (MB)')
-        
-        # Training results plot
-        train_data = pd.DataFrame(self.training_results).T
-        
-        # Validation loss
-        plt.subplot(2, 2, 3)
-        sns.barplot(data=train_data, y=train_data.index, x='best_val_loss')
-        plt.title('Best Validation Loss')
-        
-        # Validation accuracy
-        plt.subplot(2, 2, 4)
-        sns.barplot(data=train_data, y=train_data.index, x='best_val_accuracy')
-        plt.title('Best Validation Accuracy')
-        
-        plt.tight_layout()
-        plt.savefig(f'{save_dir}/benchmark_results.png')
-        plt.close()
-        
-        # Save numerical results
-        results_df = pd.DataFrame({
-            'Model': list(self.benchmark_results.keys()),
-            'Inference Time (ms)': [r['inference_mean_ms'] for r in self.benchmark_results.values()],
-            'CPU Memory (MB)': [r['memory_impact_cpu_memory_mb'] for r in self.benchmark_results.values()],
-            'Best Val Loss': [self.training_results[m]['best_val_loss'] for m in self.benchmark_results.keys()],
-            'Best Val Accuracy': [self.training_results[m]['best_val_accuracy'] for m in self.benchmark_results.keys()],
-            'Epochs Trained': [self.training_results[m]['epochs_trained'] for m in self.benchmark_results.keys()]
-        })
-        results_df.to_csv(f'{save_dir}/benchmark_results.csv', index=False)
-        
-        return results_df
+            if not hasattr(model_class, 'forward'):
+                raise ValueError(f"Model {model_class.__name__} missing forward method")
 
-def main():
-    # Update path to look in parent directories
-    file_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 
-                            'words_250000_train.txt')
+    def train_model(
+        self,
+        model_class: Type,
+        model_name: str,
+        config: Any
+    ) -> Dict[str, Any]:
+        """Train and evaluate a single model"""
+        metrics = {
+            'train_loss': [],
+            'completion_rate': [],
+            'val_accuracy': [],
+            'validation_times': [],
+            'epoch_times': [],      # Track per-epoch time
+            'batch_times': [],      # Track per-batch time
+            'total_time': 0.0       # Total training time
+        }
+        
+        try:
+            model_start = time.time()
+            model = model_class(config=config).to(self.device)
+            
+            # Log model size
+            num_params = sum(p.numel() for p in model.parameters())
+            print(f"\nModel {model_name} has {num_params:,} parameters")
+            
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay
+            )
+            criterion = nn.CrossEntropyLoss()
+            
+            # Training loop
+            steps = 0
+            for epoch in range(self.config.max_epochs):
+                epoch_start = time.time()
+                model.train()
+                
+                for batch_idx, batch in enumerate(tqdm(self.train_loader, desc=f"Epoch {epoch}")):
+                    batch_start = time.time()
+                    try:
+                        batch = {k: v.to(self.device) for k, v in batch.items()}
+                        batch['target_distribution'] = batch.pop('target')
+                        
+                        # Forward pass
+                        outputs = model(batch)
+                        loss = criterion(outputs, batch['target_distribution'])
+                        
+                        # Backward pass
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                        
+                        # Track batch time
+                        batch_time = time.time() - batch_start
+                        metrics['batch_times'].append(batch_time)
+                        
+                        # Log metrics every N steps
+                        steps += 1
+                        if steps % self.config.log_every_n_steps == 0:
+                            metrics['train_loss'].append(loss.item())
+                            
+                            # Time validation
+                            val_start = time.time()
+                            completion_rate, val_accuracy = self._validate_model(model)
+                            val_time = time.time() - val_start
+                            
+                            metrics['completion_rate'].append(completion_rate)
+                            metrics['val_accuracy'].append(val_accuracy)
+                            metrics['validation_times'].append(val_time)
+                            
+                            print(f"\nStep {steps}:")
+                            print(f"Batch Time: {batch_time:.3f}s")
+                            print(f"Validation Time: {val_time:.2f}s")
+                            print(f"Completion Rate: {completion_rate:.3f}")
+                            print(f"Validation Accuracy: {val_accuracy:.3f}")
+                            
+                            if self.config.wandb_logging:
+                                wandb.log({
+                                    'train_loss': loss.item(),
+                                    'completion_rate': completion_rate,
+                                    'val_accuracy': val_accuracy,
+                                    'validation_time': val_time,
+                                    'batch_time': batch_time,
+                                    'epoch': epoch,
+                                    'step': steps
+                                })
+                                
+                    except Exception as e:
+                        print(f"Error in batch {batch_idx}: {str(e)}")
+                        continue
+                        
+                # Track epoch time
+                epoch_time = time.time() - epoch_start
+                metrics['epoch_times'].append(epoch_time)
+                print(f"\nEpoch {epoch} took {epoch_time:.2f}s")
+                
+            # Track total time
+            metrics['total_time'] = time.time() - model_start
+            print(f"\nTotal training time for {model_name}: {metrics['total_time']:.2f}s")
+            
+            # Compute and log timing statistics
+            avg_batch = np.mean(metrics['batch_times'])
+            avg_val = np.mean(metrics['validation_times'])
+            print(f"Average batch time: {avg_batch:.3f}s")
+            print(f"Average validation time: {avg_val:.3f}s")
+            
+        except Exception as e:
+            print(f"Error in model {model_name}: {str(e)}")
+            if self.config.wandb_logging:
+                wandb.run.finish()
+            
+        return metrics
+
+    def _validate_model(self, model: nn.Module) -> Tuple[float, float]:
+        """Run validation and compute metrics"""
+        model.eval()
+        completed = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for batch in self.val_loader:
+                try:
+                    # Convert batch to device and handle target
+                    batch = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+                    if 'target' in batch:
+                        batch['target_distribution'] = batch.pop('target')
+                    
+                    # Get model predictions
+                    outputs = model(batch)
+                    predictions = outputs.argmax(dim=1)
+                    targets = batch['target_distribution'].argmax(dim=1)
+                    
+                    # Track accuracy
+                    correct += (predictions == targets).sum().item()
+                    
+                    # Track completion rate
+                    if 'word' in batch:
+                        for i, word in enumerate(batch['word']):
+                            pred_letter = chr(predictions[i].item() + ord('a'))
+                            if pred_letter in word:
+                                completed += 1
+                        total += len(batch['word'])
+                    
+                except Exception as e:
+                    print(f"Error in validation batch: {str(e)}")
+                    print(f"Batch keys: {batch.keys()}")
+                    continue
+        
+        completion_rate = completed / total if total > 0 else 0.0
+        accuracy = correct / total if total > 0 else 0.0
+        
+        return completion_rate, accuracy
+
+    def run_all_benchmarks(self) -> Dict[str, Dict[str, Any]]:
+        """Run benchmarks for all model classes"""
+        # Initialize data loaders if not already done
+        if self.train_loader is None or self.val_loader is None:
+            self.train_loader, self.val_loader = get_dataloaders(
+                data_dir=self.data_dir,
+                batch_size=self.config.batch_size,
+                data_percentage=self.config.data_percentage,
+                quick_mode=self.config.quick_mode,
+                max_length=self.config.max_length
+            )  # Removed p_value parameter
+
+        # Initialize wandb if enabled
+        if self.config.wandb_logging:
+            try:
+                wandb.init(
+                    project="hangman-benchmarks",
+                    config=self.config.__dict__,
+                    name=f"benchmark-{time.strftime('%Y%m%d-%H%M%S')}"
+                )
+            except Exception as e:
+                print(f"Failed to initialize wandb: {str(e)}")
+                self.config.wandb_logging = False
+
+        # Run benchmarks for each model
+        for model_class in self.model_classes:
+            model_name = model_class.__name__.lower()
+            print(f"\nBenchmarking {model_name}...")
+            
+            # Get model-specific config
+            model_config = self._get_model_config(model_class)
+            
+            try:
+                metrics = self.train_model(
+                    model_class=model_class,
+                    model_name=model_name,
+                    config=model_config
+                )
+                self.results[model_name] = metrics
+                
+            except Exception as e:
+                print(f"Failed to benchmark {model_name}: {str(e)}")
+                continue
+                
+        return self.results
+
+    def _get_model_config(self, model_class: Type) -> Any:
+        """Get appropriate configuration for model class"""
+        base_config = {
+            'input_dim': self.config.input_dim,
+            'hidden_dim': self.config.hidden_dim,
+            'max_length': self.config.max_length,
+            'learning_rate': self.config.learning_rate,
+            'weight_decay': self.config.weight_decay,
+            'warmup_steps': self.config.warmup_steps
+        }
+        
+        if model_class == TransformerModel:
+            from hangman.models.transformer_model import TransformerConfig
+            return TransformerConfig(**base_config)
+        
+        elif model_class == CNNLSTMModel:
+            from hangman.models.cnn_lstm_model import CNNLSTMConfig
+            return CNNLSTMConfig(**base_config)
+        
+        elif model_class == GNNModel:
+            from hangman.models.gnn_model import GNNConfig
+            return GNNConfig(**base_config)
+        
+        elif model_class == MLPAttentionModel:
+            from hangman.models.mlp_attention_model import MLPAttentionConfig
+            return MLPAttentionConfig(**base_config)
+        
+        else:
+            raise ValueError(f"Unknown model class: {model_class.__name__}")
+
+def main() -> None:
+    """Main benchmark execution"""
+    # Initialize configuration
+    config = BenchmarkConfig()
+    print(f"Running in {'QUICK' if config.quick_mode else 'FULL'} mode")
     
-    # Load words and take a small subset
-    with open(file_path, 'r') as f:
-        all_words = [word.strip().lower() for word in f.readlines()]
-        # Take only 1000 words for quick testing
-        words = all_words[:1000]  
-    
-    # Split into train and validation
-    train_size = int(0.8 * len(words))
-    train_words = words[:train_size]
-    val_words = words[train_size:]
-    
-    # Define models to benchmark (ordered by speed based on initial results)
-    models = [
-        MLPAttentionModel,    # Fastest (7.46ms)
-        CNNLSTMModel,         # Second (13.65ms)
-        GNNModel,             # Third (14.12ms)
-        TransformerModel      # Slowest (28.73ms)
-    ]
-    
-    # Run benchmarks with smaller epochs and batch size
+    # Initialize benchmarker
     benchmarker = ModelBenchmarker(
-        model_classes=models,
-        train_words=train_words,
-        val_words=val_words,
-        batch_size=32,        # Reduced from 64
-        max_epochs=3          # Reduced from 10
+        config=config,
+        model_classes=[TransformerModel, CNNLSTMModel, GNNModel, MLPAttentionModel],
+        data_dir=Path("p_analysis")
     )
     
-    # Run performance benchmarks
-    benchmarker.run_performance_benchmarks()
-    
-    # Train and evaluate models
-    benchmarker.train_and_evaluate()
-    
-    # Plot and save results
-    results = benchmarker.plot_results()
-    print("\nFinal Results:")
-    print(results)
+    # Run benchmarks
+    try:
+        benchmarker.run_all_benchmarks()
+    except Exception as e:
+        print(f"Benchmark failed: {str(e)}")
+        raise
+    finally:
+        if config.wandb_logging:
+            wandb.finish()
 
 if __name__ == "__main__":
     main() 

@@ -1,115 +1,110 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict
-from .base_model import BaseHangmanModel
+from typing import Dict, Optional, Tuple
+from .base_model import BaseHangmanModel, ModelConfig
+from dataclasses import dataclass
 import pytorch_lightning as pl
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-class MLPAttentionModel(BaseHangmanModel, pl.LightningModule):
-    def __init__(
-        self,
-        max_word_length: int = 30,
-        hidden_dims: list = [64, 128, 64],
-        num_heads: int = 4,
-        dropout: float = 0.1,
-        learning_rate: float = 1e-3
-    ):
-        super().__init__()
-        self.save_hyperparameters()
+@dataclass
+class MLPAttentionConfig(ModelConfig):
+    """MLP-Attention specific configuration"""
+    num_layers: int = 3
+    attention_heads: int = 4
+    attention_dropout: float = 0.1
+    use_layer_norm: bool = True
+    activation: str = 'relu'
+    
+    def __post_init__(self):
+        """Validate configuration"""
+        valid_activations = {'relu', 'gelu', 'silu'}
+        if self.activation not in valid_activations:
+            raise ValueError(f"activation must be one of {valid_activations}")
+
+class MLPAttentionModel(BaseHangmanModel):
+    """MLP with self-attention for Hangman"""
+    
+    def __init__(self, config: MLPAttentionConfig):
+        """Initialize MLP-Attention architecture"""
+        super().__init__(config)
         
-        # Initial word processing
-        self.word_encoder = nn.Sequential(
-            nn.Linear(28, hidden_dims[0]),
-            nn.LayerNorm(hidden_dims[0]),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
+        # Initialize embeddings
+        self.embedding = nn.Linear(config.input_dim, config.hidden_dim)
         
-        # Position encoding
-        self.pos_embedding = nn.Parameter(torch.randn(1, max_word_length, hidden_dims[0]))
-        
-        # Multi-head self-attention
-        self.self_attention = nn.MultiheadAttention(
-            embed_dim=hidden_dims[0],
-            num_heads=num_heads,
-            dropout=dropout,
+        # Initialize attention
+        self.attention = nn.MultiheadAttention(
+            embed_dim=config.hidden_dim,
+            num_heads=config.attention_heads,
+            dropout=config.attention_dropout,
             batch_first=True
         )
-        self.attention_norm = nn.LayerNorm(hidden_dims[0])
         
-        # Deep MLP layers with residual connections
-        self.mlp_layers = nn.ModuleList()
-        for i in range(len(hidden_dims) - 1):
-            self.mlp_layers.append(
-                ResidualMLPBlock(
-                    hidden_dims[i],
-                    hidden_dims[i + 1],
-                    dropout=dropout
-                )
-            )
+        # Initialize MLP layers
+        mlp_layers = []
+        for _ in range(config.num_layers):
+            mlp_layers.extend([
+                nn.Linear(config.hidden_dim, config.hidden_dim),
+                nn.LayerNorm(config.hidden_dim) if config.use_layer_norm else nn.Identity(),
+                self._get_activation(config.activation),
+                nn.Dropout(config.dropout)
+            ])
+        self.mlp = nn.Sequential(*mlp_layers)
         
-        # Final processing - corrected input dimension
-        final_dim = hidden_dims[-1] + 26  # Only one pooled output + alphabet state
-        self.final_layers = nn.Sequential(
-            nn.Linear(final_dim, hidden_dims[-1] // 2),
-            nn.LayerNorm(hidden_dims[-1] // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dims[-1] // 2, hidden_dims[-1] // 4),
-            nn.LayerNorm(hidden_dims[-1] // 4),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dims[-1] // 4, 26)
-        )
-        
-        self.learning_rate = learning_rate
+        # Initialize output layer
+        self.output = nn.Linear(config.hidden_dim + 26, 26)
         
         # Initialize weights
         self.apply(self._init_weights)
+    
+    def _get_activation(self, name: str) -> nn.Module:
+        """Get activation function by name"""
+        activations = {
+            'relu': nn.ReLU(),
+            'gelu': nn.GELU(),
+            'silu': nn.SiLU()
+        }
+        return activations[name]
         
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-                
-    def forward(self, x: Dict[str, torch.Tensor]) -> torch.Tensor:
-        # Process word state
-        word_state = x['word_state']  # [batch, length, 28]
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward pass with attention and MLP"""
+        # Get batch components
+        word_state = batch['word_state']  # [B, L, input_dim]
+        attention_mask = batch['attention_mask']  # [B, L]
+        alphabet_state = batch['alphabet_state']  # [B, 26]
         
-        # Initial encoding
-        encoded = self.word_encoder(word_state)
+        # Handle padding to max_length
+        B, L, D = word_state.shape
+        if L < self.config.max_length:
+            padding = torch.zeros(B, self.config.max_length - L, D, device=word_state.device)
+            word_state = torch.cat([word_state, padding], dim=1)
+            mask_padding = torch.zeros(B, self.config.max_length - L, dtype=bool, device=attention_mask.device)
+            attention_mask = torch.cat([attention_mask, mask_padding], dim=1)
         
-        # Add positional encoding
-        encoded = encoded + self.pos_embedding[:, :encoded.size(1)]
+        # Initial embedding
+        x = self.embedding(word_state)  # [B, L, hidden_dim]
         
-        # Create attention mask for padding
-        padding_mask = (word_state[:, :, -1] == 1)  # True for padding positions
-        
-        # Self-attention with residual connection
-        attended, _ = self.self_attention(
-            encoded, encoded, encoded,
-            key_padding_mask=padding_mask
+        # Self-attention
+        attention_mask = ~attention_mask  # Invert for attention
+        attended, _ = self.attention(
+            x, x, x,
+            key_padding_mask=attention_mask
         )
-        encoded = self.attention_norm(encoded + attended)
         
-        # Process through MLP layers
-        features = encoded
-        for mlp_layer in self.mlp_layers:
-            features = mlp_layer(features)
-            
-        # Global average pooling only (removed max pooling to fix dimensions)
-        mask = ~padding_mask.unsqueeze(-1)
-        avg_pooled = (features * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+        # Residual connection
+        x = x + attended
+        
+        # MLP processing
+        x = self.mlp(x)  # [B, L, hidden_dim]
+        
+        # Global average pooling
+        mask = (~attention_mask).float().unsqueeze(-1)  # [B, L, 1]
+        pooled = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)  # [B, hidden_dim]
         
         # Combine with alphabet state
-        combined = torch.cat([
-            avg_pooled,           # [batch, hidden_dims[-1]]
-            x['alphabet_state']   # [batch, 26]
-        ], dim=1)
+        combined = torch.cat([pooled, alphabet_state], dim=1)  # [B, hidden_dim + 26]
         
-        return self.final_layers(combined)
+        return self.output(combined)  # [B, 26]
     
     def training_step(self, batch, batch_idx):
         logits = self(batch)

@@ -1,72 +1,61 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict
-from .base_model import BaseHangmanModel
+from typing import Dict, Optional
+from .base_model import BaseHangmanModel, ModelConfig
 import pytorch_lightning as pl
 import wandb
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from dataclasses import dataclass
 
-class TransformerModel(BaseHangmanModel, pl.LightningModule):
-    def __init__(
-        self,
-        max_word_length: int = 30,
-        hidden_dim: int = 128,              # Reduced from 384
-        num_heads: int = 4,                 # Reduced from 12
-        num_layers: int = 2,                # Reduced from 6
-        dropout: float = 0.1,
-        learning_rate: float = 1e-4,
-        warmup_steps: int = 100             # Reduced from 1000
-    ):
-        super().__init__()
-        self.save_hyperparameters()
+@dataclass
+class TransformerConfig(ModelConfig):
+    """Transformer-specific configuration"""
+    num_heads: int = 8
+    num_layers: int = 4
+    ff_dim: Optional[int] = None  # Will default to 4 * hidden_dim
+    
+    def __post_init__(self):
+        """Set derived parameters"""
+        self.ff_dim = self.ff_dim or 4 * self.hidden_dim
+
+class TransformerModel(BaseHangmanModel):
+    """Transformer model for Hangman"""
+    
+    def __init__(self, config: TransformerConfig):
+        """Initialize transformer architecture
         
-        # Ensure hidden_dim is divisible by num_heads
-        assert hidden_dim % num_heads == 0, f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})"
+        Args:
+            config: Transformer configuration
+        """
+        super().__init__(config)
         
-        # Model parameters
-        self.max_word_length = max_word_length
-        self.hidden_dim = hidden_dim
-        self.learning_rate = learning_rate
-        
-        # Word embedding with larger capacity
-        self.word_embedding = nn.Sequential(
-            nn.Linear(28, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim)
+        # Initialize embeddings
+        self.embedding = nn.Linear(config.input_dim, config.hidden_dim)
+        self.pos_embedding = nn.Parameter(
+            torch.randn(1, config.max_length, config.hidden_dim)
         )
         
-        # Learned position embedding
-        self.pos_embedding = nn.Parameter(torch.randn(1, max_word_length, hidden_dim))
-        
-        # Transformer encoder with more layers and heads
+        # Initialize transformer
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True  # Pre-norm architecture
+            d_model=config.hidden_dim,
+            nhead=config.num_heads,
+            dim_feedforward=config.ff_dim,
+            dropout=config.dropout,
+            batch_first=True
         )
         self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers,
-            norm=nn.LayerNorm(hidden_dim)
+            encoder_layer, 
+            num_layers=config.num_layers
         )
         
-        # Enhanced combination layers
+        # Initialize output layers
         self.combine_layer = nn.Sequential(
-            nn.Linear(hidden_dim + 26, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(config.hidden_dim + 26, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 26)
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, 26)
         )
         
         # Initialize weights
@@ -78,36 +67,49 @@ class TransformerModel(BaseHangmanModel, pl.LightningModule):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
                 
-    def forward(self, x: Dict[str, torch.Tensor]) -> torch.Tensor:
-        # Process word state [batch_size, max_length, 28]
-        word_state = x['word_state']
-        if word_state.size(1) < self.max_word_length:
-            padding = torch.zeros(
-                word_state.size(0),
-                self.max_word_length - word_state.size(1),
-                word_state.size(2),
-                device=word_state.device
-            )
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward pass of transformer
+        
+        Args:
+            batch: Input batch containing:
+                - word_state: [B, L, input_dim]
+                - attention_mask: [B, L]
+                - alphabet_state: [B, 26]
+                
+        Returns:
+            Logits tensor [B, 26]
+        """
+        # Get batch components
+        word_state = batch['word_state']  # [B, L, input_dim]
+        attention_mask = batch['attention_mask']  # [B, L]
+        alphabet_state = batch['alphabet_state']  # [B, 26]
+        
+        # Handle padding to max_length
+        B, L, D = word_state.shape
+        if L < self.config.max_length:
+            padding = torch.zeros(B, self.config.max_length - L, D, device=word_state.device)
             word_state = torch.cat([word_state, padding], dim=1)
+            mask_padding = torch.zeros(B, self.config.max_length - L, dtype=bool, device=attention_mask.device)
+            attention_mask = torch.cat([attention_mask, mask_padding], dim=1)
         
-        # Enhanced embedding process
-        embedded = self.word_embedding(word_state)
-        embedded = embedded + self.pos_embedding[:, :embedded.size(1)]
+        # Embedding with positional encoding
+        x = self.embedding(word_state)  # [B, L, hidden_dim]
+        x = x + self.pos_embedding[:, :x.size(1)]  # Add positional encoding
         
-        # Create padding mask
-        padding_mask = (word_state[:, :, -1] == 1)
+        # Create attention mask for transformer
+        padding_mask = ~attention_mask  # Invert for transformer
         
-        # Transformer processing with residual connection
-        transformed = self.transformer(embedded, src_key_padding_mask=padding_mask)
+        # Transformer layers
+        x = self.transformer(x, src_key_padding_mask=padding_mask)
         
-        # Sophisticated pooling
-        mask = ~padding_mask.unsqueeze(-1)
-        pooled = (transformed * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+        # Pool valid tokens only
+        mask = attention_mask.unsqueeze(-1).float()  # [B, L, 1]
+        pooled = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)  # [B, hidden_dim]
         
         # Combine with alphabet state
-        combined = torch.cat([pooled, x['alphabet_state']], dim=1)
+        combined = torch.cat([pooled, alphabet_state], dim=1)  # [B, hidden_dim + 26]
         
-        return self.combine_layer(combined)
+        return self.combine_layer(combined)  # [B, 26]
     
     def training_step(self, batch, batch_idx):
         logits = self(batch)
@@ -120,15 +122,26 @@ class TransformerModel(BaseHangmanModel, pl.LightningModule):
         
         return loss
     
+    def validation_step(self, batch, batch_idx):
+        logits = self(batch)
+        loss = nn.CrossEntropyLoss()(logits, batch['target_distribution'])
+        
+        # Log metrics
+        self.log('val_loss', loss)
+        accuracy = (logits.argmax(dim=1) == batch['target_distribution'].argmax(dim=1)).float().mean()
+        self.log('val_accuracy', accuracy)
+        
+        return loss
+    
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.learning_rate,
-            weight_decay=0.01
+            weight_decay=self.weight_decay
         )
         scheduler = CosineAnnealingLR(
             optimizer,
-            T_max=self.hparams.warmup_steps,
+            T_max=self.warmup_steps,
             eta_min=self.learning_rate / 10
         )
         return {
