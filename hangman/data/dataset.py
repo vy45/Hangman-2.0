@@ -179,6 +179,9 @@ class HangmanValidationDataset(BaseHangmanDataset):
         """
         super().__init__()
         self.max_length = max_length
+        self.word_processor = word_processor
+        self.simulator = HangmanSimulator(word_processor, optimal_prob=1.0)
+        print(f"Created validation dataset with {len(self.word_processor.word_list)} words")  # Debug print
         
         val_file = Path(data_dir) / "validation_words.txt"
         if not val_file.exists():
@@ -187,29 +190,33 @@ class HangmanValidationDataset(BaseHangmanDataset):
         with open(val_file, 'r') as f:
             self.val_words = [w.strip() for w in f.readlines()]
             
-        self.word_processor = word_processor
-        self.simulator = HangmanSimulator(word_processor, optimal_prob=1.0)
         print(f"Loaded validation dataset with {len(self.val_words):,} words")
     
     def __len__(self):
         return len(self.val_words)
     
     def __getitem__(self, idx):
+        """Get a validation game state."""
         word = self.val_words[idx]
         # Get initial state (no letters guessed)
         state = self.simulator.generate_game_state(word, set())
         
-        # Pad sequence and create mask
-        word_state = state['word_state']
-        padded_state, attention_mask = self._pad_sequence(word_state)
+        # Pad word_state to max_length
+        padded_word_state = np.zeros((self.max_length, 28))  # Initialize with zeros
+        word_length = len(word)
+        padded_word_state[:word_length] = state['word_state']  # Copy actual word state
+        
+        # Create attention mask (1 for real positions, 0 for padding)
+        attention_mask = np.zeros(self.max_length, dtype=bool)
+        attention_mask[:word_length] = True
         
         return {
-            'word_state': padded_state,
-            'attention_mask': attention_mask,
+            'word_state': torch.FloatTensor(padded_word_state),
+            'attention_mask': torch.BoolTensor(attention_mask),
             'alphabet_state': torch.FloatTensor(state['alphabet_state']),
-            'word_length': torch.LongTensor([state['word_length']]),
-            'target': torch.FloatTensor(state['target_distribution']),
-            'word': word  # Make sure this is included!
+            'word_length': torch.LongTensor([word_length]),
+            'target_distribution': torch.FloatTensor(state['target_distribution']),
+            'word': word
         }
 
     def _pad_sequence(self, sequence, max_length=None):
@@ -226,18 +233,26 @@ class HangmanValidationDataset(BaseHangmanDataset):
         return torch.FloatTensor(padded), torch.BoolTensor(mask)
 
 
+class HangmanSubset(Subset):
+    """Custom Subset class that preserves dictionary items from dataset"""
+    def __getitem__(self, idx):
+        return self.dataset[self.indices[idx]]
+
+
 def get_dataloaders(
     data_dir: Path,
     batch_size: int,
     data_percentage: float = 100.0,
     quick_mode: bool = False,
-    max_length: int = 30
+    max_length: int = 30,
+    validation_size: Optional[int] = None
 ) -> Tuple[DataLoader, DataLoader]:
     """Get train and validation dataloaders"""
     print("Creating dataloaders...")
     print(f"Data directory: {data_dir}")
     print(f"Quick mode: {quick_mode}")
     print(f"Data percentage: {data_percentage}%")
+    print(f"Validation size: {validation_size}")  # Debug print
     
     # Create datasets
     train_dataset = HangmanDataset(
@@ -252,35 +267,48 @@ def get_dataloaders(
     with open(val_file, 'r') as f:
         val_words = [w.strip() for w in f.readlines()]
     
-    # Create validation dataset with proper word processor
-    val_dataset = HangmanValidationDataset(
-        data_dir=str(data_dir),
-        word_processor=WordProcessor(val_words),  # Pass the actual validation words
-        max_length=max_length
-    )
+    print(f"Total validation words available: {len(val_words)}")  # Debug print
     
     # Sample training data if needed
     if data_percentage < 100:
         num_train = int(len(train_dataset) * data_percentage / 100)
         indices = torch.randperm(len(train_dataset))[:num_train]
-        train_dataset = Subset(train_dataset, indices)
+        train_dataset = HangmanSubset(train_dataset, indices)
         print(f"Using {data_percentage}% of training data: {num_train:,} samples")
     
-    if quick_mode:
-        num_val = len(val_dataset) // 5
-        val_indices = torch.randperm(len(val_dataset))[:num_val]
-        val_dataset = Subset(val_dataset, val_indices)
-        print(f"Quick mode: Using {num_val} validation samples")
+    # Reduce validation set size
+    if validation_size is not None:
+        val_words = val_words[:validation_size]
+        print(f"Using reduced validation set: {len(val_words)} words")
+    
+    print(f"Final validation set size: {len(val_words)} words")  # Debug print
+    
+    # Create validation dataset with proper word processor
+    val_dataset = HangmanValidationDataset(
+        data_dir=str(data_dir),
+        word_processor=WordProcessor(val_words),
+        max_length=max_length
+    )
     
     # Configure dataloaders
     dataloader_kwargs = {
-        'batch_size': batch_size,
         'num_workers': 0 if quick_mode else 4,
         'pin_memory': torch.cuda.is_available(),
         'persistent_workers': False if quick_mode else True
     }
     
-    train_loader = DataLoader(train_dataset, shuffle=True, **dataloader_kwargs)
-    val_loader = DataLoader(val_dataset, shuffle=False, **dataloader_kwargs)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        **dataloader_kwargs
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        **dataloader_kwargs
+    )
     
     return train_loader, val_loader 

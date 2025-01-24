@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Any
 from .word_processor import WordProcessor
 import torch
 import time
@@ -8,9 +8,15 @@ import matplotlib.pyplot as plt
 import json
 
 class HangmanSimulator:
-    """Generates training data through biased sampling"""
+    """Simulates Hangman game states."""
     
-    def __init__(self, word_processor: WordProcessor, optimal_prob: float = 0.7):
+    def __init__(self, word_processor, optimal_prob: float = 0.5):
+        """Initialize simulator.
+        
+        Args:
+            word_processor: WordProcessor instance
+            optimal_prob: Probability for target distribution (default: 0.5)
+        """
         self.word_processor = word_processor
         self.optimal_prob = optimal_prob
         self.stats = {
@@ -22,41 +28,50 @@ class HangmanSimulator:
             'game_lengths': []  # Store number of guesses for each game
         }
         
-    def generate_game_state(self, word: str, guessed: Set[str]) -> Dict:
-        """Create a game state representation"""
-        pattern = ['_'] * len(word)
-        for i, letter in enumerate(word):
-            if letter in guessed:
-                pattern[i] = letter
-                
-        # Get next guess distribution
-        freq = self.word_processor.get_pattern_frequencies(''.join(pattern), guessed)
+    def generate_game_state(self, word: str, guessed: Set[str]) -> Dict[str, Any]:
+        """Generate a game state for a word with guessed letters.
         
-        # Create feature vectors
-        word_state = np.zeros((len(word), 28))  # 26 letters + mask + padding
+        Args:
+            word: The target word
+            guessed: Set of already guessed letters
+            
+        Returns:
+            Dictionary containing:
+                - word_state: One-hot encoded pattern
+                - alphabet_state: Available letters (1 for available, 0 for guessed)
+                - word_length: Length of word
+                - target_distribution: Target probabilities for next guess
+        """
+        # Create word state (one-hot encoding for each position)
+        pattern = ['_' if letter not in guessed else letter for letter in word]
+        word_state = np.zeros((len(word), 28))  # 26 letters + '_' + padding
+        
         for i, char in enumerate(pattern):
             if char == '_':
-                word_state[i, 26] = 1  # mask token
+                word_state[i, 26] = 1  # '_' position
             else:
                 word_state[i, ord(char) - ord('a')] = 1
                 
+        # Create alphabet state (1 for available letters)
         alphabet_state = np.zeros(26)
-        for letter in guessed:
-            alphabet_state[ord(letter) - ord('a')] = 1
-            
-        # Create target distribution from actual remaining letters
+        for i in range(26):
+            letter = chr(ord('a') + i)
+            if letter not in guessed:
+                alphabet_state[i] = 1
+                
+        # Create target distribution based on actual letters in word
+        target = np.zeros(26)
         remaining_letters = set(word) - guessed
-        target_dist = np.zeros(26)
-        if remaining_letters:  # If there are letters left to guess
-            prob = 1.0 / len(remaining_letters)
+        if remaining_letters:
+            # Equal probability for all remaining letters in word
             for letter in remaining_letters:
-                target_dist[ord(letter) - ord('a')] = prob
-            
+                target[ord(letter) - ord('a')] = 1.0 / len(remaining_letters)
+        
         return {
             'word_state': word_state,
             'alphabet_state': alphabet_state,
             'word_length': len(word),
-            'target_distribution': target_dist
+            'target_distribution': target
         }
     
     def simulate_game(self, word: str) -> List[Dict]:
