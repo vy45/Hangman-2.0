@@ -109,16 +109,17 @@ class HangmanPlayer:
         return
                 
     def run(self):
-        # Play a game until we run out of lives or letters
+        # Generates data by actually playing games
         while (self.lives_left > 0) and (len(self.letters_remaining) > 0):
-            guess = np.argmax(np.squeeze(self.z.eval({self.z.arguments[0]: np.array(self.encode_obscured_word()),
-                                                      self.z.arguments[1]: np.array(self.encode_previous_guesses())})))
+            guess = np.argmax(np.squeeze(self.z.eval({
+                self.z.arguments[0]: np.array(self.encode_obscured_word()),
+                self.z.arguments[1]: np.array(self.encode_previous_guesses())
+            })))
             self.store_guess_and_result(guess)
         
-        # Return the observations for use in training (both inputs, predictions, and losses)
-        return(np.array(self.obscured_words_seen),
-               np.array(self.letters_previously_guessed),
-               np.array(self.correct_responses))
+        return (np.array(self.obscured_words_seen),
+                np.array(self.letters_previously_guessed),
+                np.array(self.correct_responses))
     
     def show_words_seen(self):
         for word in self.obscured_words_seen:
@@ -144,12 +145,19 @@ class HangmanPlayer:
         return(ended_in_success, correct_guesses, incorrect_guesses, letters_in_word)
     
     def create_LSTM_net(input_obscured_word_seen, input_letters_guessed_previously):
-    with cntk.layers.default_options(initial_state = 0.1):
-        lstm_outputs = cntk.layers.Recurrence(cntk.layers.LSTM(MAX_NUM_INPUTS))(input_obscured_word_seen)
-        final_lstm_output = cntk.ops.sequence.last(lstm_outputs)
-        combined_input = cntk.ops.splice(final_lstm_output, input_letters_guessed_previously)
-        dense_layer = cntk.layers.Dense(26, name='final_dense_layer')(combined_input)
-        return(dense_layer)
+        with cntk.layers.default_options(initial_state = 0.1):
+            # 1. LSTM layer processing the obscured word
+            lstm_outputs = cntk.layers.Recurrence(cntk.layers.LSTM(MAX_NUM_INPUTS))(input_obscured_word_seen)
+            
+            # 2. Get final LSTM state
+            final_lstm_output = cntk.ops.sequence.last(lstm_outputs)
+            
+            # 3. Combine LSTM output with previously guessed letters
+            combined_input = cntk.ops.splice(final_lstm_output, input_letters_guessed_previously)
+            
+            # 4. Final dense layer for letter predictions
+            dense_layer = cntk.layers.Dense(26, name='final_dense_layer')(combined_input)
+            return dense_layer
     
 input_obscured_word_seen = cntk.ops.input_variable(shape=27,
                                                    dynamic_axes=[cntk.Axis.default_batch_axis(),

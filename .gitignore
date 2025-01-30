@@ -1,3 +1,81 @@
+# Ignore everything
+*
+
+# But not these files...
+!.gitignore
+!*.py
+!words_250000_train.txt
+!README.md
+
+# Even if they are in subdirectories
+!*/
+
+# Explicitly ignore these Python-related files/dirs
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.pkl
+.ipynb_checkpoints/
+
+# Ignore logs directory
+logs/
+*.log
+
+# Ignore data directories
+data/
+hangman_data/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data files
+*.pkl
+*.txt
+*.csv
+
+# Model files
+*.pt
+*.pth
+
+# Logs
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Virtual Environment
+venv/
+env/
+.env/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+
+# Data directories
+hangman_data/
+data/
+
+# OS files
+.DS_Store
+Thumbs.db
+
 # Python
 __pycache__/
 *.py[cod]

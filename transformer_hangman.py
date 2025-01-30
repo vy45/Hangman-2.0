@@ -19,6 +19,7 @@ import re
 from collections import Counter
 from multiprocessing import Pool
 import time
+import math
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # Constants
@@ -32,72 +33,113 @@ FREQ_CUTOFF = 10
 SIMULATION_CORRECT_GUESS_PROB = 0.5
 MIN_NGRAM_LENGTH = 3
 MAX_NGRAM_LENGTH = 5
+LEARNING_RATE = 0.0003  # Lower learning rate for transformer
 
-class MaryLSTMModel(nn.Module):
-    def __init__(self, hidden_dim=128, embedding_dim=8, dropout_rate=0.4, use_batch_norm=False):
+class TransformerHangmanModel(nn.Module):
+    def __init__(self, hidden_dim=128, embedding_dim=8, num_heads=4, num_layers=3, dropout_rate=0.4, use_batch_norm=False):
         super().__init__()
         self.use_batch_norm = use_batch_norm
         
-        # Embedding layer for characters (27 inputs: 0=mask, 1-26=a-z)
+        # Embedding layer for characters
         self.char_embedding = nn.Embedding(27, embedding_dim)
         
-        # Length encoding dictionary (5-bit representation)
-        self.length_encoding = {
-            i: torch.tensor([int(x) for x in format(i, '05b')], dtype=torch.float32)
-            for i in range(1, 33)  # Support lengths 1-32
-        }
-        
-        # LSTM processing the embedded sequence
-        self.lstm = nn.LSTM(
-            input_size=embedding_dim,
-            hidden_size=hidden_dim,
-            batch_first=True
+        # Positional encoding
+        self.pos_encoding = nn.Parameter(
+            self.init_positional_encoding(32, embedding_dim),
+            requires_grad=False  # Usually kept fixed #why sinusoidal initialisation?
         )
         
-        # Batch normalization layers (optional)
+        # Length encoding
+        self.length_encoding = {
+            i: torch.tensor([int(x) for x in format(i, '05b')], dtype=torch.float32)
+            for i in range(1, 33)
+        }
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim,
+            dropout=dropout_rate,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+        
+        # Batch normalization
         if use_batch_norm:
-            self.bn1 = nn.BatchNorm1d(hidden_dim + 26 + 5 + 1)  # +1 for vowel ratio
+            self.bn1 = nn.BatchNorm1d(embedding_dim + 26 + 5 + 1)
             self.bn2 = nn.BatchNorm1d(hidden_dim)
         
-        # Dropout layer
+        # Dropout
         self.dropout = nn.Dropout(dropout_rate)
         
-        # Final dense layers
-        self.combine = nn.Linear(hidden_dim + 26 + 5 + 1, hidden_dim)  # +1 for vowel ratio
+        # Dense layers
+        self.combine = nn.Linear(embedding_dim + 26 + 5 + 1, hidden_dim)
         self.output = nn.Linear(hidden_dim, 26)
         
-    def forward(self, word_state, guessed_letters, word_length, vowel_ratio):
-        # Embed characters (word_state is already indices)
-        embedded = self.char_embedding(word_state)
+    def init_positional_encoding(self, max_len, d_model):
+        """Initialize positional encoding with sinusoidal values"""
+        pe = torch.zeros(1, max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         
-        # Process through LSTM
-        lstm_out, _ = self.lstm(embedded)
-        final_lstm = lstm_out[:, -1]
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        
+        return pe
+        
+    def create_padding_mask(self, word_state):
+        # Create mask for padding tokens
+        return word_state == 26  # 26 is the padding token
+        
+    def forward(self, word_state, guessed_letters, word_length, vowel_ratio):
+        # Get sequence length for each batch
+        batch_size = word_state.size(0)
+        seq_len = word_state.size(1)
+        
+        # Embed characters and add positional encoding
+        embedded = self.char_embedding(word_state)
+        embedded = embedded + self.pos_encoding[:, :seq_len, :]
+        
+        # Create padding mask
+        padding_mask = self.create_padding_mask(word_state)
+        
+        # Pass through transformer
+        transformer_out = self.transformer(
+            embedded,
+            src_key_padding_mask=padding_mask
+        )
+        
+        # Global average pooling over sequence length
+        pooled = torch.mean(transformer_out, dim=1)
         
         # Get length encoding
         length_encoding = torch.stack([self.length_encoding[l.item()] for l in word_length])
         
-        # Include vowel ratio in combined features
+        # Combine features
         combined_features = torch.cat([
-            final_lstm,
+            pooled,
             guessed_letters,
-            length_encoding.to(final_lstm.device),
-            vowel_ratio.unsqueeze(1)  # Add vowel ratio
+            length_encoding.to(pooled.device),
+            vowel_ratio.unsqueeze(1)
         ], dim=1)
         
         # Apply batch norm if enabled
         if self.use_batch_norm:
             combined_features = self.bn1(combined_features)
         
-        # First dense layer with dropout
+        # Dense layers with dropout
         hidden = self.dropout(F.relu(self.combine(combined_features)))
         
-        # Second batch norm if enabled
         if self.use_batch_norm:
             hidden = self.bn2(hidden)
         
-        # Output layer
-        return F.softmax(self.output(hidden), dim=-1)
+        # Output probabilities
+        return F.softmax(self.output(hidden), dim=-1) 
+    
 
 class EarlyStopping:
     def __init__(self, patience=4, min_delta=0.001):
@@ -667,7 +709,7 @@ def setup_logging():
     
     # Create log filename with timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = log_dir / f'mary_hangman_{timestamp}.log'
+    log_file = log_dir / f'transformer_hangman_{timestamp}.log'
     
     # Setup file handler
     file_handler = logging.FileHandler(log_file)
@@ -720,7 +762,7 @@ def train_model(model, train_states, val_states, val_words, epochs=100):
     """Modified training loop for length-specific batches"""
     logging.info(f"Starting training for {epochs} epochs")
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0003, weight_decay=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=0.001)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
     early_stopping = EarlyStopping(patience=4, min_delta=0.001)
     
@@ -742,7 +784,7 @@ def train_model(model, train_states, val_states, val_words, epochs=100):
     
     def save_checkpoint(epoch, val_loss):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        path = f'{DATA_DIR}/mary_model_epoch{epoch}_{timestamp}.pt'
+        path = f'{DATA_DIR}/transformer_model_epoch{epoch}_{timestamp}.pt'
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -1065,7 +1107,14 @@ def evaluate_saved_model(model_path):
     
     try:
         # Load the model
-        model = MaryLSTMModel().to(DEVICE)
+        model = TransformerHangmanModel(
+            hidden_dim=128,
+            embedding_dim=32,
+            num_heads=4,
+            num_layers=3,
+            dropout_rate=0.4,
+            use_batch_norm=True
+        ).to(DEVICE)
         checkpoint = torch.load(model_path)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
@@ -1088,7 +1137,7 @@ def evaluate_saved_model(model_path):
 
 def main():
     # Add argument parsing
-    parser = argparse.ArgumentParser(description='Train Mary Hangman Model')
+    parser = argparse.ArgumentParser(description='Train transformer Hangman Model')
     parser.add_argument('--force-new-data', action='store_true', 
                        help='Force generation of new dataset even if one exists')
     parser.add_argument('--evaluate', type=str,
@@ -1097,7 +1146,7 @@ def main():
 
     # Setup logging
     log_file = setup_logging()
-    logging.info("Starting Mary's Hangman training")
+    logging.info("Starting transformer's Hangman training")
     logging.info(f"Using device: {DEVICE}")
     
     try:
@@ -1124,7 +1173,14 @@ def main():
             return
 
         # Initialize model
-        model = MaryLSTMModel().to(DEVICE)
+        model = TransformerHangmanModel(
+            hidden_dim=128,
+            embedding_dim=32,
+            num_heads=4,
+            num_layers=3,
+            dropout_rate=0.4,
+            use_batch_norm=True
+        ).to(DEVICE)
         num_params = sum(p.numel() for p in model.parameters())
         logging.info(f"Model initialized with {num_params:,} parameters")
         
@@ -1138,8 +1194,8 @@ def main():
         
         # Save results
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        model_path = f'{DATA_DIR}/mary_model_{timestamp}.pt'
-        metrics_path = f'{DATA_DIR}/mary_metrics_{timestamp}.pkl'
+        model_path = f'{DATA_DIR}/transformer_model_{timestamp}.pt'
+        metrics_path = f'{DATA_DIR}/transformer_metrics_{timestamp}.pkl'
         
         # Now we have access to both model and optimizer
         torch.save({

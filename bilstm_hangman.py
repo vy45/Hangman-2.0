@@ -32,8 +32,9 @@ FREQ_CUTOFF = 10
 SIMULATION_CORRECT_GUESS_PROB = 0.5
 MIN_NGRAM_LENGTH = 3
 MAX_NGRAM_LENGTH = 5
+LEARNING_RATE = 0.001  # Default for BiLSTM
 
-class MaryLSTMModel(nn.Module):
+class BiLSTMHangmanModel(nn.Module):
     def __init__(self, hidden_dim=128, embedding_dim=8, dropout_rate=0.4, use_batch_norm=False):
         super().__init__()
         self.use_batch_norm = use_batch_norm
@@ -47,11 +48,14 @@ class MaryLSTMModel(nn.Module):
             for i in range(1, 33)  # Support lengths 1-32
         }
         
-        # LSTM processing the embedded sequence
+        # Bidirectional LSTM
         self.lstm = nn.LSTM(
             input_size=embedding_dim,
-            hidden_size=hidden_dim,
-            batch_first=True
+            hidden_size=hidden_dim // 2,  # Half size since bidirectional concatenates
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.2 if dropout_rate > 0 else 0
         )
         
         # Batch normalization layers (optional)
@@ -62,42 +66,48 @@ class MaryLSTMModel(nn.Module):
         # Dropout layer
         self.dropout = nn.Dropout(dropout_rate)
         
+        # Attention layer
+        self.attention = nn.Linear(hidden_dim, 1)
+        
         # Final dense layers
         self.combine = nn.Linear(hidden_dim + 26 + 5 + 1, hidden_dim)  # +1 for vowel ratio
         self.output = nn.Linear(hidden_dim, 26)
         
     def forward(self, word_state, guessed_letters, word_length, vowel_ratio):
-        # Embed characters (word_state is already indices)
-        embedded = self.char_embedding(word_state)
+        # Embed characters
+        embedded = self.char_embedding(word_state)  # [batch, seq_len, embed_dim]
         
-        # Process through LSTM
-        lstm_out, _ = self.lstm(embedded)
-        final_lstm = lstm_out[:, -1]
+        # Process through BiLSTM
+        lstm_out, _ = self.lstm(embedded)  # [batch, seq_len, hidden_dim]
+        
+        # Attention mechanism
+        attention_weights = F.softmax(self.attention(lstm_out), dim=1)
+        attended = torch.sum(attention_weights * lstm_out, dim=1)
         
         # Get length encoding
         length_encoding = torch.stack([self.length_encoding[l.item()] for l in word_length])
         
-        # Include vowel ratio in combined features
+        # Combine features
         combined_features = torch.cat([
-            final_lstm,
+            attended,
             guessed_letters,
-            length_encoding.to(final_lstm.device),
-            vowel_ratio.unsqueeze(1)  # Add vowel ratio
+            length_encoding.to(attended.device),
+            vowel_ratio.unsqueeze(1)
         ], dim=1)
         
         # Apply batch norm if enabled
         if self.use_batch_norm:
             combined_features = self.bn1(combined_features)
         
-        # First dense layer with dropout
+        # Dense layers with dropout
         hidden = self.dropout(F.relu(self.combine(combined_features)))
         
-        # Second batch norm if enabled
         if self.use_batch_norm:
             hidden = self.bn2(hidden)
         
-        # Output layer
-        return F.softmax(self.output(hidden), dim=-1)
+        # Output probabilities
+        return F.softmax(self.output(hidden), dim=-1) 
+    
 
 class EarlyStopping:
     def __init__(self, patience=4, min_delta=0.001):
@@ -259,7 +269,7 @@ def simulate_game_states(word):
         guessed_letters.add(next_letter)
         if next_letter not in word:
                 wrong_guesses += 1
-    
+
     return states
 
 def adjust_vowel_weights(target_dist, current_state, vowel_ratio):
@@ -667,7 +677,7 @@ def setup_logging():
     
     # Create log filename with timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = log_dir / f'mary_hangman_{timestamp}.log'
+    log_file = log_dir / f'bilstm_hangman_{timestamp}.log'
     
     # Setup file handler
     file_handler = logging.FileHandler(log_file)
@@ -720,7 +730,7 @@ def train_model(model, train_states, val_states, val_words, epochs=100):
     """Modified training loop for length-specific batches"""
     logging.info(f"Starting training for {epochs} epochs")
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0003, weight_decay=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=0.001)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
     early_stopping = EarlyStopping(patience=4, min_delta=0.001)
     
@@ -742,7 +752,7 @@ def train_model(model, train_states, val_states, val_words, epochs=100):
     
     def save_checkpoint(epoch, val_loss):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        path = f'{DATA_DIR}/mary_model_epoch{epoch}_{timestamp}.pt'
+        path = f'{DATA_DIR}/bilstm_model_epoch{epoch}_{timestamp}.pt'
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -1065,7 +1075,7 @@ def evaluate_saved_model(model_path):
     
     try:
         # Load the model
-        model = MaryLSTMModel().to(DEVICE)
+        model = BiLSTMHangmanModel(use_batch_norm=True).to(DEVICE)
         checkpoint = torch.load(model_path)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
@@ -1088,7 +1098,7 @@ def evaluate_saved_model(model_path):
 
 def main():
     # Add argument parsing
-    parser = argparse.ArgumentParser(description='Train Mary Hangman Model')
+    parser = argparse.ArgumentParser(description='Train bilstm Hangman Model')
     parser.add_argument('--force-new-data', action='store_true', 
                        help='Force generation of new dataset even if one exists')
     parser.add_argument('--evaluate', type=str,
@@ -1097,7 +1107,7 @@ def main():
 
     # Setup logging
     log_file = setup_logging()
-    logging.info("Starting Mary's Hangman training")
+    logging.info("Starting bilstm's Hangman training")
     logging.info(f"Using device: {DEVICE}")
     
     try:
@@ -1124,7 +1134,7 @@ def main():
             return
 
         # Initialize model
-        model = MaryLSTMModel().to(DEVICE)
+        model = BiLSTMHangmanModel(use_batch_norm=True).to(DEVICE)
         num_params = sum(p.numel() for p in model.parameters())
         logging.info(f"Model initialized with {num_params:,} parameters")
         
@@ -1138,8 +1148,8 @@ def main():
         
         # Save results
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        model_path = f'{DATA_DIR}/mary_model_{timestamp}.pt'
-        metrics_path = f'{DATA_DIR}/mary_metrics_{timestamp}.pkl'
+        model_path = f'{DATA_DIR}/bilstm_model_{timestamp}.pt'
+        metrics_path = f'{DATA_DIR}/bilstm_metrics_{timestamp}.pkl'
         
         # Now we have access to both model and optimizer
         torch.save({

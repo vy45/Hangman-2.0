@@ -16,10 +16,7 @@ def load_data(filename):
     return words
 
 def simulate_missing_letters(word, p_missing=0.4):
-    """
-    Randomly replace letters with '0' to simulate missing letters,
-    with p_missing chance for each letter.
-    """
+    """Randomly replace letters with '0' to simulate missing letters"""
     simulated_word = ''
     for char in word:
         simulated_word += '0' if random.random() < p_missing else char
@@ -29,8 +26,11 @@ def preprocess_data(words, char_to_int, max_word_length, p_missing=0.4):
     sequences = []
     targets = []
     for word in words:
+        # Create partially obscured word
         word_with_missing = simulate_missing_letters(word, p_missing)
-        sequences.append([char_to_int[char] if char in char_to_int else char_to_int['0'] for char in word_with_missing])
+        # Convert to integer sequences
+        sequences.append([char_to_int[char] if char in char_to_int else char_to_int['0'] 
+                        for char in word_with_missing])
         targets.append([char_to_int[char] for char in word])
     sequences = pad_sequences(sequences, maxlen=max_word_length, padding='post')
     targets = pad_sequences(targets, maxlen=max_word_length, padding='post')
@@ -121,19 +121,16 @@ class DAWG:
         return possible_words
 
     def predict_next_letter(self, partial_word, guessed_letters):
+        # Convert word to current game state using guessed letters
         word = partial_word.replace(" ", "")
         word = ''.join([letter if letter in guessed_letters else '_' for letter in word])
-        # switch to LSTM if 70% of the word has been predicted
-        if word.count('_') <= 0.3*(len(word)):
-            word_with_missing = word.replace('_', '0')
-            return predict_word(model, word_with_missing, char_to_int, int_to_char, max_word_length, guessed_letters)
         
-        # else use the DAWG data structure to predict the letter using letter frequency
+        # Early game strategy (DAWG-based)
         possible_words = self.generate_possible_words(self.root, partial_word)
-
         letter_frequency = {}
         for word in possible_words:
             for letter in word:
+                # Only count frequencies of unguessed letters
                 if letter not in letter_frequency and letter not in guessed_letters:
                     letter_frequency[letter] = 1
                 elif letter not in guessed_letters:
