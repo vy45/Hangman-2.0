@@ -10,6 +10,8 @@ from datetime import datetime
 import argparse
 from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from collections import defaultdict
+from sklearn.model_selection import train_test_split
 
 # Constants
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -18,13 +20,22 @@ BATCH_SIZE = 64
 DATA_DIR = 'hangman_data'
 MAX_WORD_LENGTH = 32  # Maximum word length to handle
 LEARNING_RATE = 0.001
+SIMULATION_CORRECT_GUESS_PROB = 0.5
 HIDDEN_SIZES = [512, 256, 128]  # Deep network architecture
 PAD_TOKEN = '*'  # Different from '_' used for unknown letters
-
+LEARNING_RATE = 0.001
+COMPLETION_EVAL_WORDS = 10000
+EPOCHS = 100
 class MLPHangmanModel(nn.Module):
     def __init__(self, max_word_length=MAX_WORD_LENGTH, dropout_rate=0.4, use_batch_norm=True):
         super().__init__()
         self.use_batch_norm = use_batch_norm
+        
+        # Initialize with proper weight scaling
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
         
         # Embedding for each position (28 tokens: 0-25=a-z, 26=unknown, 27=padding)
         self.char_embedding = nn.Embedding(28, 8, padding_idx=27)
@@ -52,6 +63,9 @@ class MLPHangmanModel(nn.Module):
         
         self.layers = nn.Sequential(*layers)
         
+        # Apply weight initialization
+        self.apply(init_weights)
+        
     def forward(self, word_states, guessed_letters, lengths, vowel_ratios):
         """Forward pass"""
         # Get batch size
@@ -65,7 +79,7 @@ class MLPHangmanModel(nn.Module):
         
         # Get length encoding (5-bit)
         length_encoding = torch.stack([
-            torch.tensor([int(x) for x in format(l.item(), '05b')], dtype=torch.float32)
+            torch.tensor([int(x) for x in format(int(l.item()), '05b')], dtype=torch.float32)
             for l in lengths
         ]).to(embedded.device)
         
@@ -90,7 +104,7 @@ class MLPHangmanModel(nn.Module):
         return F.softmax(x, dim=-1)
 
 def simulate_game_states(word):
-    """Simulate two games for each word with vowel-ratio-based strategy"""
+    """Simulate two games with proper vowel-aware strategy"""
     all_states = []
     for _ in range(2):  # Simulate each word twice
         states = []
@@ -100,10 +114,8 @@ def simulate_game_states(word):
         unguessed_vowels = VOWELS - guessed_letters
         wrong_guesses = 0
         
-        while (len(guessed_letters) < 26 and 
-               len(word_letters - guessed_letters) > 0 and 
-               wrong_guesses < 6):  # Stop at 6 wrong guesses
-            
+        while len(guessed_letters) < 26 and len(word_letters - guessed_letters) > 0 and wrong_guesses < 6:
+            # Calculate current state and vowel ratio
             current_state = ''.join([c if c in guessed_letters else '_' for c in word])
             known_vowels = sum(1 for c in word if c in VOWELS and c in guessed_letters)
             vowel_ratio = known_vowels / len(word)
@@ -114,73 +126,84 @@ def simulate_game_states(word):
                 'guessed_letters': sorted(list(guessed_letters)),
                 'original_word': word,
                 'vowel_ratio': vowel_ratio,
-                'remaining_lives': 6 - wrong_guesses  # Add remaining lives
+                'remaining_lives': 6 - wrong_guesses
             }
             
-            # Calculate target distribution (only known missing letters)
-            remaining_letters = set(word) - guessed_letters
+            # Calculate target distribution (only for known missing letters)
+            remaining_letters = word_letters - guessed_letters
+            if not remaining_letters:
+                return all_states
+            
             target_dist = {l: 0.0 for l in ALPHABET}
+            # Set target distribution based on remaining letters
             for letter in remaining_letters:
                 target_dist[letter] = 1.0
             
             # Normalize target distribution
             total = sum(target_dist.values())
-            if total > 0:
-                target_dist = {k: v/total for k, v in target_dist.items()}
+            target_dist = {k: v/total for k, v in target_dist.items()}
             
             state['target_distribution'] = target_dist
             states.append(state)
             
-            # Choose next letter based on vowel ratio strategy
-            if vowel_ratio < 0.2 and unguessed_vowels:
-                next_letter = random.choice(list(unguessed_vowels))
-                unguessed_vowels.remove(next_letter)
-            elif vowel_ratio > 0.4 and len(guessed_letters) < 25:
-                available = set(ALPHABET) - guessed_letters - VOWELS
-                if not available:
-                    available = set(ALPHABET) - guessed_letters
-                next_letter = random.choice(list(available))
-            else:
-                if random.random() < 0.5 and (word_letters - guessed_letters):
-                    next_letter = random.choice(list(word_letters - guessed_letters))
+            # Choose next letter based on strategy
+            if random.random() < SIMULATION_CORRECT_GUESS_PROB:
+                # Guess from known letters
+                consonant_choices = remaining_letters - VOWELS
+                vowel_choices = remaining_letters & VOWELS
+
+                if vowel_ratio <= 0.2 and vowel_choices:
+                    next_letter = random.choice(list(vowel_choices))
+                elif vowel_ratio >= 0.4 and consonant_choices:
+                    next_letter = random.choice(list(consonant_choices))
                 else:
-                    available = set(ALPHABET) - guessed_letters
-                    next_letter = random.choice(list(available))
+                    next_letter = random.choice(list(remaining_letters))
+            else:
+                # Random guess from unguessed letters
+                available_letters = set(ALPHABET) - guessed_letters
+                consonant_choices = available_letters - VOWELS
+                vowel_choices = available_letters & VOWELS
+                
+                if vowel_ratio <= 0.2 and vowel_choices:
+                    next_letter = random.choice(list(vowel_choices))
+                elif vowel_ratio >= 0.4 and consonant_choices:
+                    next_letter = random.choice(list(consonant_choices))
+                else:
+                    next_letter = random.choice(list(available_letters))
             
             guessed_letters.add(next_letter)
             if next_letter not in word:
                 wrong_guesses += 1
         
-        all_states.extend(states)  # Keep all states regardless of game outcome
+        all_states.extend(states)
     
     return all_states
 
 def prepare_input(state):
-    """Prepare input tensors for MLP model with distinct padding"""
-    # Use 27 for padding token, 26 for unknown letters ('_'), 0-25 for a-z
+    """Prepare input tensors with proper initialization"""
     char_indices = []
     current_state = state['current_state']
     
-    # First handle the actual word characters
+    # Handle word characters
     for c in current_state:
         if c in ALPHABET:
             char_indices.append(ALPHABET.index(c))
         else:  # Unknown letter '_'
             char_indices.append(26)
     
-    # Add padding tokens
+    # Add padding
     padding_needed = MAX_WORD_LENGTH - len(current_state)
-    char_indices.extend([27] * padding_needed)  # Use 27 for padding
+    char_indices.extend([27] * padding_needed)
     
-    char_indices = torch.tensor(char_indices, dtype=torch.long)
+    # Create tensors properly
+    char_indices = torch.LongTensor(char_indices)
+    guessed = torch.zeros(26, dtype=torch.float32)
     
-    # Prepare other features
-    guessed = torch.zeros(26)
     for letter in state['guessed_letters']:
         if letter in ALPHABET:
             guessed[ALPHABET.index(letter)] = 1
-            
-    vowel_ratio = torch.tensor([state['vowel_ratio']], dtype=torch.float32)
+    
+    vowel_ratio = torch.tensor(state['vowel_ratio'], dtype=torch.float32)
     
     return char_indices, guessed, vowel_ratio
 
@@ -205,6 +228,45 @@ def save_data(train_states, val_states, val_words):
         logging.error(f"Error saving dataset: {str(e)}")
         logging.error(traceback.format_exc())
         raise 
+
+
+def load_and_preprocess_words(filename='words_250000_train.txt'):
+    """Load words and split into train/validation sets"""
+    with open(filename, 'r') as f:
+        words = [word.strip().lower() for word in f.readlines()]
+    
+    # Filter words
+    words = [w for w in words if all(c in ALPHABET for c in w)]
+    word_lengths = [len(w) for w in words]
+    
+    # Count frequency of each length
+    length_counts = defaultdict(int)
+    for length in word_lengths:
+        length_counts[length] += 1
+    
+    # Filter out words with lengths that appear only once
+    min_samples_per_length = 5
+    valid_lengths = {length for length, count in length_counts.items() 
+                    if count >= min_samples_per_length}
+    
+    filtered_words = [w for w in words if len(w) in valid_lengths]
+    filtered_lengths = [len(w) for w in filtered_words]
+    
+    try:
+        train_words, val_words = train_test_split(
+            filtered_words, test_size=0.2, stratify=filtered_lengths, random_state=42
+        )
+    except ValueError:
+        print("Stratified split failed, falling back to random split")
+        train_words, val_words = train_test_split(
+            words, test_size=0.2, random_state=42
+        )
+    
+    print(f"Train set: {len(train_words)} words")
+    print(f"Validation set: {len(val_words)} words")
+    
+    return train_words, val_words
+
 
 def load_data(force_new=False):
     """Load existing MLP dataset or return None if not found"""
@@ -242,37 +304,57 @@ def setup_logging():
     )
     return log_file
 
-def train_model(model, train_states, val_states, val_words, epochs=100):
-    """Train the MLP model"""
+def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
+    """Modified training loop with debugging"""
     logging.info(f"Starting training for {epochs} epochs")
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    # Reduce initial learning rate
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=0.001)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
     criterion = nn.KLDivLoss(reduction='batchmean')
+    
+    # Add debugging info
+    def debug_tensor(tensor, name):
+        """Debug helper that handles both float and integer tensors"""
+        if torch.isnan(tensor.float()).any():
+            logging.error(f"NaN detected in {name}")
+            return False
+        if torch.isinf(tensor.float()).any():
+            logging.error(f"Inf detected in {name}")
+            return False
+        
+        # Handle integer tensors differently from float tensors
+        if tensor.dtype in [torch.long, torch.int32, torch.int64]:
+            logging.debug(f"{name} - min: {tensor.min().item()}, max: {tensor.max().item()}, mean: {tensor.float().mean().item():.4f}")
+        else:
+            logging.debug(f"{name} - min: {tensor.min().item():.4f}, max: {tensor.max().item():.4f}, mean: {tensor.mean().item():.4f}")
+        return True
     
     best_val_loss = float('inf')
     best_model_path = None
     
-    # Prepare batches
-    train_batches = [train_states[i:i + BATCH_SIZE] 
-                    for i in range(0, len(train_states), BATCH_SIZE)]
-    
     for epoch in range(epochs):
         model.train()
         total_loss = 0
+        num_batches = 0
         
-        # Shuffle batches
-        random.shuffle(train_batches)
+        # Create and shuffle batches
+        indices = list(range(len(train_states)))
+        random.shuffle(indices)
+        batches = [indices[i:i + BATCH_SIZE] for i in range(0, len(indices), BATCH_SIZE)]
         
-        for batch in tqdm(train_batches, desc=f"Epoch {epoch + 1}/{epochs}"):
-            # Prepare batch
+        batch_iterator = tqdm(batches, desc=f"Epoch {epoch + 1}/{epochs}")
+        
+        for batch_idx, batch_indices in enumerate(batch_iterator):
+            # Prepare batch data
             word_states = []
             guessed_letters = []
             lengths = []
             vowel_ratios = []
             targets = []
             
-            for state in batch:
+            for idx in batch_indices:
+                state = train_states[idx]
                 char_indices, guessed, vowel_ratio = prepare_input(state)
                 word_states.append(char_indices)
                 guessed_letters.append(guessed)
@@ -284,30 +366,72 @@ def train_model(model, train_states, val_states, val_words, epochs=100):
                 ))
             
             # Stack tensors with correct shapes
-            word_states = torch.stack(word_states).to(DEVICE)  # [batch_size, max_word_length]
-            guessed_letters = torch.stack(guessed_letters).to(DEVICE)  # [batch_size, 26]
-            lengths = torch.tensor(lengths, dtype=torch.float32).to(DEVICE)  # [batch_size]
-            vowel_ratios = torch.tensor(vowel_ratios, dtype=torch.float32).to(DEVICE)  # [batch_size]
-            targets = torch.stack(targets).to(DEVICE)  # [batch_size, vocab_size]
+            word_states = torch.stack(word_states).to(DEVICE)
+            guessed_letters = torch.stack(guessed_letters).to(DEVICE)
+            lengths = torch.tensor(lengths, dtype=torch.float32).to(DEVICE)
+            vowel_ratios = torch.tensor(vowel_ratios, dtype=torch.float32).to(DEVICE)
+            targets = torch.stack(targets).to(DEVICE)
+            
+            # Debug inputs
+            if batch_idx == 0:
+                logging.info("\nDebugging first batch:")
+                debug_tensor(word_states, "word_states")
+                debug_tensor(guessed_letters, "guessed_letters")
+                debug_tensor(lengths, "lengths")
+                debug_tensor(vowel_ratios, "vowel_ratios")
+                debug_tensor(targets, "targets")
             
             # Forward pass
             predictions = model(word_states, guessed_letters, lengths, vowel_ratios)
+            
+            # Debug predictions
+            if not debug_tensor(predictions, "predictions"):
+                raise ValueError("NaN or Inf in predictions")
+            
+            # Add small epsilon to prevent log(0)
+            epsilon = 1e-8
+            predictions = predictions.clamp(min=epsilon, max=1-epsilon)
+            
+            # Calculate loss
             loss = criterion(predictions.log(), targets)
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+                logging.error(f"NaN/Inf loss detected at batch {batch_idx}")
+                logging.error(f"Loss value: {loss.item()}")
+                raise ValueError("Training failed due to NaN/Inf loss")
             
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
             
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # Debug gradients
+            if batch_idx == 0:
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm()
+                        logging.debug(f"Gradient norm for {name}: {grad_norm}")
+                        if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                            raise ValueError(f"NaN/Inf gradient detected in {name}")
+            
+            optimizer.step()
             total_loss += loss.item()
+            num_batches += 1
+            
+            # Update progress bar
+            batch_iterator.set_postfix({'loss': loss.item()})
         
-        # Validation
+        avg_loss = total_loss / num_batches
+        logging.info(f"\nEpoch {epoch + 1} average loss: {avg_loss:.4f}")
+        
+        # Validation phase
         val_loss = evaluate_model(model, val_states)
-        completion_rate = calculate_completion_rate(model, val_words[:1000])
+        completion_rate = calculate_completion_rate(model, val_words[:COMPLETION_EVAL_WORDS])
         
-        logging.info(f"Epoch {epoch + 1}:")
-        logging.info(f"Train Loss: {total_loss/len(train_batches):.4f}")
+        logging.info(f"\nEpoch {epoch + 1}:")
+        logging.info(f"Train Loss: {avg_loss:.4f}")
         logging.info(f"Val Loss: {val_loss:.4f}")
         logging.info(f"Completion Rate: {completion_rate:.2%}")
         
@@ -357,12 +481,12 @@ def evaluate_model(model, val_states):
                     dtype=torch.float32
                 ))
             
-            # Stack tensors
-            word_states = torch.stack(word_states).to(DEVICE)
-            guessed_letters = torch.stack(guessed_letters).to(DEVICE)
-            lengths = torch.tensor(lengths).to(DEVICE)
-            vowel_ratios = torch.stack(vowel_ratios).to(DEVICE)
-            targets = torch.stack(targets).to(DEVICE)
+            # Stack tensors with correct shapes
+            word_states = torch.stack(word_states).to(DEVICE)  # [batch_size, max_word_length]
+            guessed_letters = torch.stack(guessed_letters).to(DEVICE)  # [batch_size, 26]
+            lengths = torch.tensor(lengths, dtype=torch.float32).to(DEVICE)  # [batch_size]
+            vowel_ratios = torch.tensor(vowel_ratios, dtype=torch.float32).to(DEVICE)  # [batch_size]
+            targets = torch.stack(targets).to(DEVICE)  # [batch_size, vocab_size]
             
             predictions = model(word_states, guessed_letters, lengths, vowel_ratios)
             loss = criterion(predictions.log(), targets)
@@ -391,10 +515,12 @@ def calculate_completion_rate(model, words):
                 }
                 
                 char_indices, guessed, vowel_ratio = prepare_input(state)
-                char_indices = char_indices.unsqueeze(0).to(DEVICE)
-                guessed = guessed.unsqueeze(0).to(DEVICE)
-                length = torch.tensor([len(current_state)]).to(DEVICE)
-                vowel_ratio = vowel_ratio.unsqueeze(0).to(DEVICE)
+                
+                # Add batch dimension and convert to tensors
+                char_indices = torch.tensor(char_indices).unsqueeze(0).to(DEVICE)  # [1, max_word_length]
+                guessed = torch.tensor(guessed).unsqueeze(0).to(DEVICE)  # [1, 26]
+                length = torch.tensor([len(current_state)], dtype=torch.float32).to(DEVICE)  # [1]
+                vowel_ratio = torch.tensor([vowel_ratio], dtype=torch.float32).to(DEVICE)  # [1]
                 
                 # Get model prediction
                 predictions = model(char_indices, guessed, length, vowel_ratio)
@@ -430,13 +556,8 @@ def main():
         train_states, val_states, val_words = load_data(force_new=args.force_new_data)
         
         if train_states is None or args.force_new_data:
-            # Load words
-            with open('words_250000_train.txt', 'r') as f:
-                words = [w.strip().lower() for w in f.readlines()]
-            
             # Split into train/val
-            train_words = words[:int(0.8 * len(words))]
-            val_words = words[int(0.8 * len(words)):]
+            train_words, val_words = load_and_preprocess_words()
             
             # Generate datasets
             logging.info("Generating training states...")
@@ -446,7 +567,7 @@ def main():
             
             logging.info("Generating validation states...")
             val_states = []
-            for word in tqdm(val_words[:1000]):  # Limit validation set
+            for word in tqdm(val_words):  
                 val_states.extend(simulate_game_states(word))
             
             save_data(train_states, val_states, val_words)
@@ -455,7 +576,7 @@ def main():
         model = MLPHangmanModel().to(DEVICE)
         
         # Train model
-        model, best_model_path = train_model(model, train_states, val_states, val_words)
+        model, best_model_path = train_model(model, train_states, val_states, val_words, epochs=EPOCHS)
         
         logging.info("Training complete!")
         

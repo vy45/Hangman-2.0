@@ -27,7 +27,7 @@ ALPHABET = 'abcdefghijklmnopqrstuvwxyz'
 BATCH_SIZE = 64
 DATA_DIR = 'hangman_data'
 VALIDATION_EPISODES = 10000
-COMPLETION_EVAL_WORDS = 1000
+COMPLETION_EVAL_WORDS = 10000
 FREQ_CUTOFF = 10
 SIMULATION_CORRECT_GUESS_PROB = 0.5
 MIN_NGRAM_LENGTH = 3
@@ -124,6 +124,8 @@ def load_and_preprocess_words(filename='words_250000_train.txt'):
     with open(filename, 'r') as f:
         words = [word.strip().lower() for word in f.readlines()]
     
+    words = words[:100000]
+
     # Filter words
     words = [w for w in words if all(c in ALPHABET for c in w)]
     word_lengths = [len(w) for w in words]
@@ -229,6 +231,7 @@ def simulate_game_states(word):
     word_letters = set(word)
     VOWELS = set('aeiou')
     unguessed_vowels = VOWELS - guessed_letters
+    wrong_guesses = 0
     
     while len(guessed_letters) < 26 and len(word_letters - guessed_letters) > 0 and wrong_guesses < 6:
         # Calculate current state and vowel ratio
@@ -241,20 +244,38 @@ def simulate_game_states(word):
             'current_state': current_state,
             'guessed_letters': sorted(list(guessed_letters)),
             'original_word': word,
-            'vowel_ratio': vowel_ratio
+            'vowel_ratio': vowel_ratio,
+            'remaining_lives': 6 - wrong_guesses
         })
         
-        # Choose next letter
-        if vowel_ratio < 0.2 and unguessed_vowels:  # Prioritize vowels early
-            next_letter = random.choice(list(unguessed_vowels))
-            unguessed_vowels.remove(next_letter)
-        else:
-            # Regular guessing logic
-            if random.random() < SIMULATION_CORRECT_GUESS_PROB and (word_letters - guessed_letters):
-                next_letter = random.choice(list(word_letters - guessed_letters))
+        remaining_letters = word_letters - guessed_letters
+        if not remaining_letters:
+            return states
+        
+        # Choose next letter based on strategy
+        if random.random() < SIMULATION_CORRECT_GUESS_PROB:
+            # Guess from known letters
+            consonant_choices = remaining_letters - VOWELS
+            vowel_choices = remaining_letters & VOWELS
+
+            if vowel_ratio <= 0.2 and vowel_choices:
+                next_letter = random.choice(list(vowel_choices))
+            elif vowel_ratio >= 0.4 and consonant_choices:
+                next_letter = random.choice(list(consonant_choices))
             else:
-                available_letters = set(ALPHABET) - guessed_letters
-                next_letter = random.choice(list(available_letters))
+                next_letter = random.choice(list(remaining_letters))
+        else:
+            # Random guess from unguessed letters
+            consonant_choices = set(ALPHABET) - guessed_letters - VOWELS
+            vowel_choices = set(ALPHABET) - guessed_letters & VOWELS
+            available_letters = consonant_choices | vowel_choices
+            
+            if vowel_ratio <= 0.2 and vowel_choices:
+                next_letter = random.choice(list(vowel_choices))
+            elif vowel_ratio >= 0.4 and consonant_choices:
+                next_letter = random.choice(list(consonant_choices))
+            else:
+                next_letter = random.choice(list(remaining_letters))
         
         guessed_letters.add(next_letter)
         if next_letter not in word:

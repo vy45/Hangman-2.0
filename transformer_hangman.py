@@ -271,6 +271,7 @@ def simulate_game_states(word):
     word_letters = set(word)
     VOWELS = set('aeiou')
     unguessed_vowels = VOWELS - guessed_letters
+    wrong_guesses = 0
     
     while len(guessed_letters) < 26 and len(word_letters - guessed_letters) > 0 and wrong_guesses < 6:
         # Calculate current state and vowel ratio
