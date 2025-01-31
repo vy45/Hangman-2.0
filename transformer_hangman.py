@@ -34,9 +34,13 @@ SIMULATION_CORRECT_GUESS_PROB = 0.5
 MIN_NGRAM_LENGTH = 3
 MAX_NGRAM_LENGTH = 5
 LEARNING_RATE = 0.0003  # Lower learning rate for transformer
+QUICK_TEST = False
+EPOCHS = 3 if QUICK_TEST else 100
+COMPLETION_EVAL_WORDS = 1000 if QUICK_TEST else 10000
+
 
 class TransformerHangmanModel(nn.Module):
-    def __init__(self, hidden_dim=128, embedding_dim=8, num_heads=4, num_layers=3, dropout_rate=0.4, use_batch_norm=False):
+    def __init__(self, hidden_dim=128, embedding_dim=32, num_heads=4, num_layers=3, dropout_rate=0.4, use_batch_norm=False):
         super().__init__()
         self.use_batch_norm = use_batch_norm
         
@@ -101,30 +105,44 @@ class TransformerHangmanModel(nn.Module):
         seq_len = word_state.size(1)
         
         # Embed characters and add positional encoding
-        embedded = self.char_embedding(word_state)
+        embedded = self.char_embedding(word_state)  # [batch_size, seq_len, embedding_dim]
         embedded = embedded + self.pos_encoding[:, :seq_len, :]
         
-        # Create padding mask
-        padding_mask = self.create_padding_mask(word_state)
+        # Create padding mask - but ensure not all positions are masked
+        padding_mask = (word_state == 26)  # 26 is the padding token
         
-        # Pass through transformer
+        # Safety check - if all positions would be masked, unmask the first position
+        if padding_mask.all():
+            padding_mask[:, 0] = False
+        
+        # Pass through transformer with key padding mask
         transformer_out = self.transformer(
             embedded,
             src_key_padding_mask=padding_mask
         )
         
         # Global average pooling over sequence length
-        pooled = torch.mean(transformer_out, dim=1)
+        # Use a mask to avoid including padding in the average
+        mask = ~padding_mask.unsqueeze(-1)  # [batch_size, seq_len, 1]
+        masked_out = transformer_out * mask
+        # Add small epsilon to avoid division by zero
+        pooled = masked_out.sum(dim=1) / (mask.sum(dim=1) + 1e-8)
         
         # Get length encoding
         length_encoding = torch.stack([self.length_encoding[l.item()] for l in word_length])
+
+        # Fix vowel_ratio dimensions - ensure it's [batch_size, 1]
+        if vowel_ratio.dim() == 1:
+            vowel_ratio = vowel_ratio.unsqueeze(-1)  # Add feature dimension if needed
+        elif vowel_ratio.dim() == 2 and vowel_ratio.size(1) > 1:
+            vowel_ratio = vowel_ratio.squeeze(-1).unsqueeze(-1)  # Ensure correct shape
         
         # Combine features
         combined_features = torch.cat([
-            pooled,
-            guessed_letters,
-            length_encoding.to(pooled.device),
-            vowel_ratio.unsqueeze(1)
+            pooled,  # [batch_size, embedding_dim]
+            guessed_letters,  # [batch_size, 26]
+            length_encoding.to(pooled.device),  # [batch_size, 5]
+            vowel_ratio  # [batch_size, 1]
         ], dim=1)
         
         # Apply batch norm if enabled
@@ -136,6 +154,9 @@ class TransformerHangmanModel(nn.Module):
         
         if self.use_batch_norm:
             hidden = self.bn2(hidden)
+        
+        # Add residual connection and layer norm
+        hidden = self.layer_norm(hidden + self.residual_dropout(combined_features))
         
         # Output probabilities
         return F.softmax(self.output(hidden), dim=-1) 
@@ -165,7 +186,10 @@ def load_and_preprocess_words(filename='words_250000_train.txt'):
     """Load words and split into train/validation sets"""
     with open(filename, 'r') as f:
         words = [word.strip().lower() for word in f.readlines()]
-    
+
+    if QUICK_TEST:
+        words = words[:10000]
+
     # Filter words
     words = [w for w in words if all(c in ALPHABET for c in w)]
     word_lengths = [len(w) for w in words]
@@ -272,7 +296,7 @@ def simulate_game_states(word):
     VOWELS = set('aeiou')
     unguessed_vowels = VOWELS - guessed_letters
     wrong_guesses = 0
-    
+
     while len(guessed_letters) < 26 and len(word_letters - guessed_letters) > 0 and wrong_guesses < 6:
         # Calculate current state and vowel ratio
         current_state = ''.join([c if c in guessed_letters else '_' for c in word])
@@ -648,17 +672,22 @@ def build_ngram_dictionary(words):
 
 def prepare_input(state):
     """Prepare input tensors for model"""
+    # Convert current state to indices
     char_indices = torch.tensor([
-        ALPHABET.index(c) if c in ALPHABET else 26 
+        ALPHABET.index(c) if c in ALPHABET else 0 if c == '_' else 26  # Use 0 for underscore, 26 for padding
         for c in state['current_state']
     ], dtype=torch.long)
     
+    # Create guessed letters tensor
     guessed = torch.zeros(26)
     for letter in state['guessed_letters']:
         if letter in ALPHABET:
             guessed[ALPHABET.index(letter)] = 1
             
-    vowel_ratio = torch.tensor([state['vowel_ratio']], dtype=torch.float32)
+    # Get vowel ratio if provided, otherwise calculate
+    vowel_ratio = state.get('vowel_ratio', torch.tensor([0.0]))
+    if not isinstance(vowel_ratio, torch.Tensor):
+        vowel_ratio = torch.tensor([float(vowel_ratio)])
     
     return char_indices, guessed, vowel_ratio
 
@@ -731,6 +760,13 @@ def setup_logging():
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     
+    # Temporarily set to DEBUG to see shape information
+    logger.setLevel(logging.DEBUG)
+    
+    # Or keep INFO level but add specific debug logs we want to see
+    logger.setLevel(logging.INFO)
+    logging.getLogger("completion_rate").setLevel(logging.DEBUG)
+    
     logging.info(f"Logging setup complete. Log file: {log_file}")
     return log_file
 
@@ -759,13 +795,28 @@ def prepare_length_batches(train_states):
     
     return batches
 
-def train_model(model, train_states, val_states, val_words, epochs=100):
+def calculate_loss(predictions, targets):
+    """Calculate loss with label smoothing and stability measures"""
+    # Add label smoothing
+    epsilon = 0.1
+    targets = (1 - epsilon) * targets + epsilon / targets.size(-1)
+    
+    # Add stability measures
+    predictions = torch.clamp(predictions, min=1e-7, max=1-1e-7)
+    
+    # KL divergence loss
+    return F.kl_div(predictions.log(), targets, reduction='batchmean')
+
+def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
     """Modified training loop for length-specific batches"""
     logging.info(f"Starting training for {epochs} epochs")
     
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=0.001)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
-    early_stopping = EarlyStopping(patience=4, min_delta=0.001)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)  # Added verbose=True
+    early_stopping = EarlyStopping(patience=5, min_delta=0.001)  # Increased patience to 5
+    
+    # Add gradient clipping threshold
+    max_grad_norm = 1.0  # Increased from 0.5 to 1.0 for more gradual clipping
     
     # Save best model
     best_val_loss = float('inf')
@@ -777,8 +828,10 @@ def train_model(model, train_states, val_states, val_words, epochs=100):
         'completion_rate': [],
         'total_time': 0,
         'stopped_epoch': epochs,
-        'gradient_norms': [],  # Track gradient norms
-        'weight_norms': []     # Track weight norms
+        'gradient_norms': [],
+        'weight_norms': [],
+        'best_val_loss': float('inf'),  # Added to track best validation loss
+        'best_epoch': 0  # Added to track best epoch
     }
     
     start_time = datetime.now()
@@ -841,92 +894,85 @@ def train_model(model, train_states, val_states, val_words, epochs=100):
                 optimizer.zero_grad()
                 predictions = model(word_states, guessed_letters, lengths, vowel_ratios)
                 
-                # Check predictions for NaN
-                if torch.isnan(predictions).any():
-                    logging.error("NaN detected in predictions!")
-                    continue
+                # Calculate loss with stability measures
+                loss = calculate_loss(predictions, targets)
                 
-                loss = F.kl_div(predictions.log(), targets, reduction='batchmean')
-                
-                # Check for NaN loss
-                if torch.isnan(loss):
-                    logging.error(f"NaN loss detected at epoch {epoch + 1}, batch {num_batches}")
-                    continue
-                
-                # Backward pass with gradient clipping
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                # Monitor gradients and weights
-                grad_norm = 0
-                weight_norm = 0
-                for param in model.parameters():
-                    if param.grad is not None:
-                        grad_norm += param.grad.norm().item()
-                    weight_norm += param.data.norm().item()
-                
-                metrics['gradient_norms'].append(grad_norm)
-                metrics['weight_norms'].append(weight_norm)
-                
-                if grad_norm > 10:  # Alert if gradients are too large
-                    logging.warning(f"Large gradient norm detected: {grad_norm}")
-                
-                optimizer.step()
-                
-                total_loss += loss.item()
-                num_batches += 1
-                
-                batch_iterator.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'avg_loss': f'{total_loss/num_batches:.4f}',
-                    'grad_norm': f'{grad_norm:.2f}'
-                })
+                if not torch.isnan(loss):
+                    loss.backward()
+                    # Apply gradient clipping before optimizer step
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                    optimizer.step()
+                    
+                    total_loss += loss.item()
+                    num_batches += 1
+                    
+                    # Log gradient norm in postfix
+                    batch_iterator.set_postfix({
+                        'loss': f'{loss.item():.4f}',
+                        'avg_loss': f'{total_loss/num_batches:.4f}',
+                        'grad_norm': f'{grad_norm:.2f}'  # Updated to use actual grad_norm
+                    })
+                else:
+                    logging.warning("NaN loss encountered during training")
             
-            # Validation
-            val_loss = evaluate_model(model, val_states)
-            completion_rate = calculate_completion_rate(model, val_words[:COMPLETION_EVAL_WORDS])
-            
-            # Store metrics
-            train_loss = total_loss / num_batches
-            metrics['train_loss'].append(train_loss)
-            metrics['val_loss'].append(val_loss)
-            metrics['completion_rate'].append(completion_rate)
-            
-            logging.info(f"\nEpoch {epoch + 1} Results:")
-            logging.info(f"Train Loss: {train_loss:.4f}")
-            logging.info(f"Val Loss: {val_loss:.4f}")
-            logging.info(f"Completion Rate: {completion_rate:.2%}")
-            logging.info(f"Average Gradient Norm: {np.mean(metrics['gradient_norms'][-num_batches:]):.2f}")
-            logging.info(f"Average Weight Norm: {np.mean(metrics['weight_norms'][-num_batches:]):.2f}")
-            
-            # Save model if it's the best so far
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model_path = save_checkpoint(epoch + 1, val_loss)
-                logging.info(f"New best model saved to: {best_model_path}")
-            
-            # Early stopping check
-            if early_stopping(val_loss):
-                logging.info(f"Early stopping triggered at epoch {epoch + 1}")
-                metrics['stopped_epoch'] = epoch + 1
-                break
-            
-            scheduler.step(val_loss)
+            # Validation phase with error handling
+            try:
+                val_loss = evaluate_model(model, val_states)
+                completion_rate = calculate_completion_rate(model, val_words[:COMPLETION_EVAL_WORDS])
+                
+                # Store metrics
+                metrics['val_loss'].append(val_loss)
+                metrics['completion_rate'].append(completion_rate)
+                metrics['train_loss'].append(total_loss / num_batches)
+                
+                # Log progress
+                logging.info(f"\nEpoch {epoch + 1} Results:")
+                logging.info(f"Train Loss: {total_loss / num_batches:.4f}")
+                logging.info(f"Val Loss: {val_loss:.4f}")
+                logging.info(f"Completion Rate: {completion_rate:.2%}")
+                
+                # Save best model
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    save_checkpoint(f'epoch{epoch+1}', val_loss)
+                
+                # Run detailed validation every 4 epochs
+                if (epoch + 1) % 4 == 0:
+                    logging.info("\nRunning detailed validation...")
+                    detailed_stats = run_detailed_validation(model, val_words[:COMPLETION_EVAL_WORDS])
+                    metrics[f'detailed_stats_epoch_{epoch+1}'] = detailed_stats
+                
+                # Add early stopping check here
+                if early_stopping(val_loss):
+                    logging.info(f"\nEarly stopping triggered at epoch {epoch + 1}")
+                    logging.info(f"Best validation loss was {best_val_loss:.4f}")
+                    metrics['stopped_epoch'] = epoch + 1
+                    break
+                
+                scheduler.step(val_loss)
+                
+            except Exception as e:
+                logging.error(f"Error during validation: {str(e)}")
+                continue
             
     except Exception as e:
-        logging.error(f"Training failed with error: {str(e)}", exc_info=True)
-        return metrics
+        logging.error(f"Training failed with error: {str(e)}")
+        raise
     
-    finally:
-        total_time = (datetime.now() - start_time).total_seconds()
-        metrics['total_time'] = total_time
-        logging.info(f"\nTraining completed in {total_time:.2f} seconds")
+    # Save final model
+    try:
+        final_path = save_checkpoint('final', best_val_loss)
+        logging.info(f"\nTraining completed in {time.time() - start_time:.2f} seconds")
         
-        # Save final model regardless of performance
-        final_path = save_checkpoint('final', val_loss)
-        logging.info(f"Final model saved to: {final_path}")
-    
-    return model, optimizer, metrics
+        # Run final detailed validation
+        logging.info("\nRunning final detailed validation...")
+        final_stats = run_detailed_validation(model, val_words)
+        metrics['final_detailed_stats'] = final_stats
+        
+        return model, optimizer, metrics
+    except Exception as e:
+        logging.error(f"Error saving final model: {str(e)}")
+        return model, optimizer, metrics
 
 def evaluate_model(model, val_states):
     """Evaluate model on validation states using length-specific batches"""
@@ -934,43 +980,37 @@ def evaluate_model(model, val_states):
     total_loss = 0
     num_batches = 0
     
-    # Prepare validation batches
-    val_batches = prepare_length_batches(val_states)
-    
-    with torch.no_grad():
-        for batch in val_batches:
-            # Prepare batch (all states have same length)
-            word_states = []
-            guessed_letters = []
-            lengths = []
-            vowel_ratios = []
-            targets = []
-            
-            for state in batch:
-                char_indices, guessed, vowel_ratio = prepare_input(state)
-                word_states.append(char_indices)
-                guessed_letters.append(guessed)
-                lengths.append(len(state['current_state']))
-                vowel_ratios.append(vowel_ratio)
-                targets.append(torch.tensor(
+    try:
+        # Prepare validation batches
+        val_batches = prepare_length_batches(val_states)
+        
+        with torch.no_grad():
+            for batch in val_batches:
+                # Prepare batch tensors
+                word_states = torch.stack([prepare_input(state)[0] for state in batch]).to(DEVICE)
+                guessed_letters = torch.stack([prepare_input(state)[1] for state in batch]).to(DEVICE)
+                lengths = torch.tensor([len(state['current_state']) for state in batch]).to(DEVICE)
+                vowel_ratios = torch.stack([prepare_input(state)[2] for state in batch]).to(DEVICE)
+                targets = torch.stack([torch.tensor(
                     list(state['target_distribution'].values()), 
                     dtype=torch.float32
-                ))
-            
-            # Stack tensors
-            word_states = torch.stack(word_states).to(DEVICE)
-            guessed_letters = torch.stack(guessed_letters).to(DEVICE)
-            lengths = torch.tensor(lengths).to(DEVICE)
-            vowel_ratios = torch.stack(vowel_ratios).to(DEVICE)
-            targets = torch.stack(targets).to(DEVICE)
-            
-            predictions = model(word_states, guessed_letters, lengths, vowel_ratios)
-            loss = F.kl_div(predictions.log(), targets, reduction='batchmean')
-            
-            total_loss += loss.item()
-            num_batches += 1
-    
-    return total_loss / num_batches if num_batches > 0 else float('inf')
+                ) for state in batch]).to(DEVICE)
+                
+                # Get predictions
+                predictions = model(word_states, guessed_letters, lengths, vowel_ratios)
+                
+                # Calculate loss
+                loss = calculate_loss(predictions, targets)
+                
+                if not torch.isnan(loss):
+                    total_loss += loss.item()
+                    num_batches += 1
+        
+        return total_loss / num_batches if num_batches > 0 else float('inf')
+        
+    except Exception as e:
+        logging.error(f"Error in evaluate_model: {str(e)}")
+        return float('inf')
 
 def calculate_completion_rate(model, words):
     """Calculate word completion rate"""
@@ -984,21 +1024,42 @@ def calculate_completion_rate(model, words):
             current_state = '_' * len(word)
             word_completed = False
             wrong_guesses = 0
+            num_guesses = 0
             word_letters = set(word)
             
-            while len(guessed_letters) < 26 and wrong_guesses < 6:  # MAX_WRONG_GUESSES = 6
-                # Prepare input
+            while len(guessed_letters) < 26 and wrong_guesses < 6:
+                # Calculate vowel ratio
+                known_vowels = sum(1 for c in word if c in 'aeiou' and c in guessed_letters)
+                vowel_ratio = known_vowels / len(word)
+                
                 state = {
                     'current_state': current_state,
-                    'guessed_letters': sorted(list(guessed_letters))
+                    'guessed_letters': sorted(list(guessed_letters)),
+                    'vowel_ratio': vowel_ratio
                 }
                 
+                # Get input tensors
                 char_indices, guessed, vowel_ratio = prepare_input(state)
+                
+                # Add batch dimension and move to device
                 char_indices = char_indices.unsqueeze(0).to(DEVICE)
                 guessed = guessed.unsqueeze(0).to(DEVICE)
+                length = torch.tensor([len(word)], dtype=torch.float32).to(DEVICE)
+                vowel_ratio = torch.tensor([vowel_ratio], dtype=torch.float32).to(DEVICE)
                 
-                # Get prediction
-                predictions = model(char_indices, guessed, torch.tensor([len(word)]), torch.tensor([vowel_ratio]))
+                try:
+                    predictions = model(char_indices, guessed, length, vowel_ratio)
+                except Exception as e:
+                    logging.error(f"Error during model forward pass for word '{word}':")
+                    logging.error(f"Current state: {current_state}")
+                    logging.error(f"Guessed letters: {guessed_letters}")
+                    logging.error(f"Input shapes:")
+                    logging.error(f"char_indices: {char_indices.shape}")
+                    logging.error(f"guessed: {guessed.shape}")
+                    logging.error(f"length: {length.shape}")
+                    logging.error(f"vowel_ratio: {vowel_ratio.shape}")
+                    raise
+                
                 valid_preds = [(i, p.item()) for i, p in enumerate(predictions[0]) 
                               if chr(i + ord('a')) not in guessed_letters]
                 next_letter = chr(max(valid_preds, key=lambda x: x[1])[0] + ord('a'))
@@ -1017,62 +1078,99 @@ def calculate_completion_rate(model, words):
             if word_completed and wrong_guesses < 6:  # Only count as completed if we didn't exceed wrong guesses
                 completed += 1
             total += 1
-            
-            # if total % 10 == 0:  # Log progress every 10 words
-            #     logging.info(f"Current completion rate: {completed/total:.2%} ({completed}/{total})")
     
     final_rate = completed / total
-    # logging.info(f"Final completion rate: {final_rate:.2%} ({completed}/{total})")
     return final_rate
 
 def run_detailed_validation(model, val_words):
-    """Run detailed validation statistics on a model"""
+    """Run detailed validation statistics with detailed prediction logging"""
     logging.info("\nRunning detailed validation statistics...")
     word_length_stats = defaultdict(lambda: {'total': 0, 'completed': 0, 'total_guesses': 0})
     
-    with torch.no_grad():
-        for word in tqdm(val_words, desc="Analyzing validation words"):
-            guessed_letters = set()
-            current_state = '_' * len(word)
-            word_completed = False
-            wrong_guesses = 0
-            word_letters = set(word)
-            num_guesses = 0
-            
-            while len(guessed_letters) < 26 and wrong_guesses < 6:
-                state = {
-                    'current_state': current_state,
-                    'guessed_letters': sorted(list(guessed_letters))
-                }
-                
-                char_indices, guessed, vowel_ratio = prepare_input(state)
-                char_indices = char_indices.unsqueeze(0).to(DEVICE)
-                guessed = guessed.unsqueeze(0).to(DEVICE)
-                
-                predictions = model(char_indices, guessed, torch.tensor([len(word)]), torch.tensor([vowel_ratio]))
-                valid_preds = [(i, p.item()) for i, p in enumerate(predictions[0]) 
-                             if chr(i + ord('a')) not in guessed_letters]
-                next_letter = chr(max(valid_preds, key=lambda x: x[1])[0] + ord('a'))
-                
-                guessed_letters.add(next_letter)
-                num_guesses += 1
-                if next_letter not in word_letters:
-                    wrong_guesses += 1
-                
-                current_state = ''.join([c if c in guessed_letters else '_' for c in word])
-                
-                if '_' not in current_state:
-                    word_completed = True
-                    break
-            
-            # Record statistics
-            length = len(word)
-            word_length_stats[length]['total'] += 1
-            word_length_stats[length]['total_guesses'] += num_guesses
-            if word_completed and wrong_guesses < 6:
-                word_length_stats[length]['completed'] += 1
+    # Create CSV filename with model type and timestamp
+    model_type = model.__class__.__name__.replace('HangmanModel', '').lower()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    csv_file = f'{DATA_DIR}/predictions_{model_type}_{timestamp}.csv'
     
-    # Print statistics by word length
+    # Open CSV file with context manager for automatic closing
+    with open(csv_file, 'w') as f:
+        # Write header
+        header = ['word', 'current_state', 'guessed_letters', 'q_values', 'chosen_letter', 'correct']
+        f.write(','.join(header) + '\n')
+        
+        # Process each word
+        with torch.no_grad():  # Disable gradient computation
+            for word in tqdm(val_words, desc="Analyzing validation words"):
+                guessed_letters = set()
+                current_state = '_' * len(word)
+                word_completed = False
+                wrong_guesses = 0
+                word_letters = set(word)
+                num_guesses = 0
+                
+                while len(guessed_letters) < 26 and wrong_guesses < 6:
+                    # Calculate vowel ratio
+                    known_vowels = sum(1 for c in word if c in 'aeiou' and c in guessed_letters)
+                    vowel_ratio = known_vowels / len(word)
+                    
+                    state = {
+                        'current_state': current_state,
+                        'guessed_letters': sorted(list(guessed_letters)),
+                        'vowel_ratio': vowel_ratio
+                    }
+                    
+                    # Get model predictions
+                    char_indices, guessed, vowel_ratio = prepare_input(state)
+                    char_indices = char_indices.unsqueeze(0).to(DEVICE)
+                    guessed = guessed.unsqueeze(0).to(DEVICE)
+                    length = torch.tensor([len(word)], dtype=torch.float32).to(DEVICE)
+                    vowel_ratio = torch.tensor([vowel_ratio], dtype=torch.float32).to(DEVICE)
+                    
+                    predictions = model(char_indices, guessed, length, vowel_ratio)
+                    
+                    # Get valid predictions and next letter
+                    valid_preds = [(i, p.item()) for i, p in enumerate(predictions[0]) 
+                                 if chr(i + ord('a')) not in guessed_letters]
+                    next_letter = chr(max(valid_preds, key=lambda x: x[1])[0] + ord('a'))
+                    
+                    # Format Q-values for CSV
+                    q_values = {chr(i + ord('a')): f"{p.item():.4f}" 
+                              for i, p in enumerate(predictions[0])}
+                    q_values_str = repr(q_values).replace(',', ';')  # Avoid CSV confusion
+                    
+                    # Write prediction data
+                    row = [
+                        word,
+                        current_state,
+                        ''.join(sorted(guessed_letters)),
+                        q_values_str,
+                        next_letter,
+                        str(next_letter in word_letters)
+                    ]
+                    f.write(','.join(row) + '\n')
+                    
+                    # Update game state
+                    guessed_letters.add(next_letter)
+                    num_guesses += 1
+                    if next_letter not in word_letters:
+                        wrong_guesses += 1
+                    
+                    current_state = ''.join([c if c in guessed_letters else '_' for c in word])
+                    
+                    if '_' not in current_state:
+                        word_completed = True
+                        break
+                
+                # Update statistics
+                length = len(word)
+                word_length_stats[length]['total'] += 1
+                word_length_stats[length]['total_guesses'] += num_guesses
+                if word_completed and wrong_guesses < 6:
+                    word_length_stats[length]['completed'] += 1
+    
+    logging.info(f"Detailed predictions saved to: {csv_file}")
+    
+    # Print statistics (rest of the function remains the same)
     logging.info("\nCompletion rates and average guesses by word length:")
     total_completed = 0
     total_words = 0

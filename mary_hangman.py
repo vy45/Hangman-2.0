@@ -22,16 +22,18 @@ import time
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # Constants
+QUICK_TEST = False
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 ALPHABET = 'abcdefghijklmnopqrstuvwxyz'
 BATCH_SIZE = 64
 DATA_DIR = 'hangman_data'
 VALIDATION_EPISODES = 10000
-COMPLETION_EVAL_WORDS = 10000
 FREQ_CUTOFF = 10
 SIMULATION_CORRECT_GUESS_PROB = 0.5
 MIN_NGRAM_LENGTH = 3
 MAX_NGRAM_LENGTH = 5
+EPOCHS = 3 if QUICK_TEST else 100
+COMPLETION_EVAL_WORDS = 1000 if QUICK_TEST else 10000
 
 class MaryLSTMModel(nn.Module):
     def __init__(self, hidden_dim=128, embedding_dim=8, dropout_rate=0.4, use_batch_norm=False):
@@ -67,22 +69,34 @@ class MaryLSTMModel(nn.Module):
         self.output = nn.Linear(hidden_dim, 26)
         
     def forward(self, word_state, guessed_letters, word_length, vowel_ratio):
-        # Embed characters (word_state is already indices)
-        embedded = self.char_embedding(word_state)
+        # Get batch size
+        batch_size = word_state.size(0)
         
-        # Process through LSTM
-        lstm_out, _ = self.lstm(embedded)
-        final_lstm = lstm_out[:, -1]
+        # LSTM processing
+        embedded = self.char_embedding(word_state)  # [batch_size, seq_len, embedding_dim]
+        lstm_out, _ = self.lstm(embedded)  # [batch_size, seq_len, hidden_size*2]
         
-        # Get length encoding
-        length_encoding = torch.stack([self.length_encoding[l.item()] for l in word_length])
+        # Get final LSTM output
+        final_lstm = lstm_out[:, -1, :]  # Take last sequence output [batch_size, hidden_size*2]
         
-        # Include vowel ratio in combined features
+        # Create length encoding
+        length_encoding = torch.stack([
+            torch.tensor([int(x) for x in format(int(l.item()), '05b')], dtype=torch.float32)
+            for l in word_length
+        ]).to(final_lstm.device)
+
+        # Fix vowel_ratio dimensions - ensure it's [batch_size, 1]
+        if vowel_ratio.dim() == 1:
+            vowel_ratio = vowel_ratio.unsqueeze(-1)  # Add feature dimension if needed
+        elif vowel_ratio.dim() == 2 and vowel_ratio.size(1) > 1:
+            vowel_ratio = vowel_ratio.squeeze(-1).unsqueeze(-1)  # Ensure correct shape
+        
+        # Concatenate features
         combined_features = torch.cat([
-            final_lstm,
-            guessed_letters,
-            length_encoding.to(final_lstm.device),
-            vowel_ratio.unsqueeze(1)  # Add vowel ratio
+            final_lstm,  # [batch_size, hidden_size*2]
+            guessed_letters,  # [batch_size, 26]
+            length_encoding,  # [batch_size, 5]
+            vowel_ratio  # [batch_size, 1]
         ], dim=1)
         
         # Apply batch norm if enabled
@@ -124,7 +138,8 @@ def load_and_preprocess_words(filename='words_250000_train.txt'):
     with open(filename, 'r') as f:
         words = [word.strip().lower() for word in f.readlines()]
     
-    words = words[:100000]
+    if QUICK_TEST:
+        words = words[:10000]
 
     # Filter words
     words = [w for w in words if all(c in ALPHABET for c in w)]
@@ -225,32 +240,41 @@ def calculate_letter_frequencies(matching_words):
     return defaultdict(float)
 
 def simulate_game_states(word):
-    """Simulate a game and generate states"""
+    """Simulate a game with proper vowel-aware strategy"""
     states = []
     guessed_letters = set()
     word_letters = set(word)
     VOWELS = set('aeiou')
-    unguessed_vowels = VOWELS - guessed_letters
     wrong_guesses = 0
     
     while len(guessed_letters) < 26 and len(word_letters - guessed_letters) > 0 and wrong_guesses < 6:
         # Calculate current state and vowel ratio
         current_state = ''.join([c if c in guessed_letters else '_' for c in word])
-        # Calculate vowel ratio based on total word length instead of known letters
         known_vowels = sum(1 for c in word if c in VOWELS and c in guessed_letters)
-        vowel_ratio = known_vowels / len(current_state)
+        vowel_ratio = known_vowels / len(word)
         
-        states.append({
+        # Create state
+        state = {
             'current_state': current_state,
             'guessed_letters': sorted(list(guessed_letters)),
             'original_word': word,
             'vowel_ratio': vowel_ratio,
             'remaining_lives': 6 - wrong_guesses
-        })
+        }
         
-        remaining_letters = word_letters - guessed_letters
-        if not remaining_letters:
-            return states
+        # Calculate target distribution (only for known missing letters)
+        remaining_letters = word_letters - guessed_letters # will never be empty
+
+        target_dist = {l: 0.0 for l in ALPHABET}
+        for letter in remaining_letters:
+            target_dist[letter] = 1.0
+            
+        # Normalize target distribution
+        total = sum(target_dist.values())
+        target_dist = {k: v/total for k, v in target_dist.items()}
+        
+        state['target_distribution'] = target_dist
+        states.append(state)
         
         # Choose next letter based on strategy
         if random.random() < SIMULATION_CORRECT_GUESS_PROB:
@@ -266,20 +290,20 @@ def simulate_game_states(word):
                 next_letter = random.choice(list(remaining_letters))
         else:
             # Random guess from unguessed letters
-            consonant_choices = set(ALPHABET) - guessed_letters - VOWELS
-            vowel_choices = set(ALPHABET) - guessed_letters & VOWELS
-            available_letters = consonant_choices | vowel_choices
+            available_letters = set(ALPHABET) - guessed_letters
+            consonant_choices = available_letters - VOWELS
+            vowel_choices = available_letters & VOWELS
             
             if vowel_ratio <= 0.2 and vowel_choices:
                 next_letter = random.choice(list(vowel_choices))
             elif vowel_ratio >= 0.4 and consonant_choices:
                 next_letter = random.choice(list(consonant_choices))
             else:
-                next_letter = random.choice(list(remaining_letters))
+                next_letter = random.choice(list(available_letters))
         
         guessed_letters.add(next_letter)
         if next_letter not in word:
-                wrong_guesses += 1
+            wrong_guesses += 1
     
     return states
 
@@ -681,35 +705,23 @@ def load_data(force_new=False):
     return None, None, None
 
 def setup_logging():
-    """Setup logging to both file and console"""
-    # Create logs directory if it doesn't exist
+    """Setup logging configuration"""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_dir = Path('logs')
     log_dir.mkdir(exist_ok=True)
-    
-    # Create log filename with timestamp
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_file = log_dir / f'mary_hangman_{timestamp}.log'
     
-    # Setup file handler
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.INFO)
+    # Configure logging to show DEBUG messages
+    logging.basicConfig(
+        level=logging.DEBUG,  # Changed from INFO to DEBUG
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
     
-    # Setup console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    
-    # Setup logging format
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    console_handler.setFormatter(formatter)
-    
-    # Setup root logger
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    
-    logging.info(f"Logging setup complete. Log file: {log_file}")
+    logging.info("Logging setup complete. Log file: " + str(log_file))
     return log_file
 
 def prepare_length_batches(train_states):
@@ -737,7 +749,7 @@ def prepare_length_batches(train_states):
     
     return batches
 
-def train_model(model, train_states, val_states, val_words, epochs=100):
+def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
     """Modified training loop for length-specific batches"""
     logging.info(f"Starting training for {epochs} epochs")
     
@@ -764,12 +776,19 @@ def train_model(model, train_states, val_states, val_words, epochs=100):
     def save_checkpoint(epoch, val_loss):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         path = f'{DATA_DIR}/mary_model_epoch{epoch}_{timestamp}.pt'
+        
+        # Convert any defaultdicts in metrics to regular dicts before saving
+        metrics_copy = metrics.copy()
+        for key in metrics_copy:
+            if isinstance(metrics_copy[key], defaultdict):
+                metrics_copy[key] = dict(metrics_copy[key])
+        
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': val_loss,
-            'metrics': metrics
+            'metrics': metrics_copy
         }, path)
         return path
     
@@ -864,6 +883,12 @@ def train_model(model, train_states, val_states, val_words, epochs=100):
             val_loss = evaluate_model(model, val_states)
             completion_rate = calculate_completion_rate(model, val_words[:COMPLETION_EVAL_WORDS])
             
+            # Run detailed validation every 4 epochs
+            if (epoch + 1) % 4 == 0:
+                logging.info("\nRunning detailed validation...")
+                detailed_stats = run_detailed_validation(model, val_words[:COMPLETION_EVAL_WORDS])
+                metrics[f'detailed_stats_epoch_{epoch+1}'] = dict(detailed_stats)
+            
             # Store metrics
             train_loss = total_loss / num_batches
             metrics['train_loss'].append(train_loss)
@@ -892,8 +917,9 @@ def train_model(model, train_states, val_states, val_words, epochs=100):
             scheduler.step(val_loss)
             
     except Exception as e:
-        logging.error(f"Training failed with error: {str(e)}", exc_info=True)
-        return metrics
+        logging.error(f"Training failed with error: {str(e)}")
+        logging.error(traceback.format_exc())
+        raise
     
     finally:
         total_time = (datetime.now() - start_time).total_seconds()
@@ -954,104 +980,146 @@ def calculate_completion_rate(model, words):
     """Calculate word completion rate"""
     model.eval()
     completed = 0
-    total = 0
+    total = len(words)
     
     with torch.no_grad():
-        for word in tqdm(words, desc="Calculating completion rate", leave=False):
+        for word in tqdm(words, desc="Calculating completion rate"):
             guessed_letters = set()
             current_state = '_' * len(word)
-            word_completed = False
             wrong_guesses = 0
-            word_letters = set(word)
             
-            while len(guessed_letters) < 26 and wrong_guesses < 6:  # MAX_WRONG_GUESSES = 6
+            while wrong_guesses < 6 and '_' in current_state:
+                # Calculate vowel ratio
+                known_vowels = sum(1 for c in word if c in 'aeiou' and c in guessed_letters)
+                vowel_ratio = known_vowels / len(word)
+                
                 # Prepare input
                 state = {
                     'current_state': current_state,
-                    'guessed_letters': sorted(list(guessed_letters))
+                    'guessed_letters': sorted(list(guessed_letters)),
+                    'vowel_ratio': vowel_ratio  # Add vowel ratio to state
                 }
                 
                 char_indices, guessed, vowel_ratio = prepare_input(state)
-                char_indices = char_indices.unsqueeze(0).to(DEVICE)
-                guessed = guessed.unsqueeze(0).to(DEVICE)
                 
-                # Get prediction
-                predictions = model(char_indices, guessed, torch.tensor([len(word)]), torch.tensor([vowel_ratio]))
-                valid_preds = [(i, p.item()) for i, p in enumerate(predictions[0]) 
+                # Add batch dimension and convert to tensors
+                char_indices = char_indices.unsqueeze(0).to(DEVICE)  # [1, max_word_length]
+                guessed = guessed.unsqueeze(0).to(DEVICE)  # [1, 26]
+                length = torch.tensor([len(current_state)], dtype=torch.float32).to(DEVICE)  # [1]
+                vowel_ratio = vowel_ratio.unsqueeze(0).to(DEVICE)  # [1]
+                
+                # Get model prediction
+                predictions = model(char_indices, guessed, length, vowel_ratio)
+                
+                # Choose next letter
+                valid_preds = [(i, p.item()) for i, p in enumerate(predictions[0])
                               if chr(i + ord('a')) not in guessed_letters]
                 next_letter = chr(max(valid_preds, key=lambda x: x[1])[0] + ord('a'))
                 
                 # Update game state
                 guessed_letters.add(next_letter)
-                if next_letter not in word_letters:  # Wrong guess
+                if next_letter in word:
+                    current_state = ''.join(c if c in guessed_letters else '_' for c in word)
+                else:
                     wrong_guesses += 1
-                
-                current_state = ''.join([c if c in guessed_letters else '_' for c in word])
-                
-                if '_' not in current_state:
-                    word_completed = True
-                    break
             
-            if word_completed and wrong_guesses < 6:  # Only count as completed if we didn't exceed wrong guesses
+            if '_' not in current_state:
                 completed += 1
-            total += 1
-            
-            # if total % 10 == 0:  # Log progress every 10 words
-            #     logging.info(f"Current completion rate: {completed/total:.2%} ({completed}/{total})")
     
-    final_rate = completed / total
-    # logging.info(f"Final completion rate: {final_rate:.2%} ({completed}/{total})")
-    return final_rate
+    return completed / total
 
 def run_detailed_validation(model, val_words):
-    """Run detailed validation statistics on a model"""
+    """Run detailed validation statistics with detailed prediction logging"""
     logging.info("\nRunning detailed validation statistics...")
     word_length_stats = defaultdict(lambda: {'total': 0, 'completed': 0, 'total_guesses': 0})
     
-    with torch.no_grad():
-        for word in tqdm(val_words, desc="Analyzing validation words"):
-            guessed_letters = set()
-            current_state = '_' * len(word)
-            word_completed = False
-            wrong_guesses = 0
-            word_letters = set(word)
-            num_guesses = 0
-            
-            while len(guessed_letters) < 26 and wrong_guesses < 6:
-                state = {
-                    'current_state': current_state,
-                    'guessed_letters': sorted(list(guessed_letters))
-                }
-                
-                char_indices, guessed, vowel_ratio = prepare_input(state)
-                char_indices = char_indices.unsqueeze(0).to(DEVICE)
-                guessed = guessed.unsqueeze(0).to(DEVICE)
-                
-                predictions = model(char_indices, guessed, torch.tensor([len(word)]), torch.tensor([vowel_ratio]))
-                valid_preds = [(i, p.item()) for i, p in enumerate(predictions[0]) 
-                             if chr(i + ord('a')) not in guessed_letters]
-                next_letter = chr(max(valid_preds, key=lambda x: x[1])[0] + ord('a'))
-                
-                guessed_letters.add(next_letter)
-                num_guesses += 1
-                if next_letter not in word_letters:
-                    wrong_guesses += 1
-                
-                current_state = ''.join([c if c in guessed_letters else '_' for c in word])
-                
-                if '_' not in current_state:
-                    word_completed = True
-                    break
-            
-            # Record statistics
-            length = len(word)
-            word_length_stats[length]['total'] += 1
-            word_length_stats[length]['total_guesses'] += num_guesses
-            if word_completed and wrong_guesses < 6:
-                word_length_stats[length]['completed'] += 1
+    # Create CSV filename with model type and timestamp
+    model_type = model.__class__.__name__.replace('HangmanModel', '').lower()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    csv_file = f'{DATA_DIR}/predictions_{model_type}_{timestamp}.csv'
     
-    # Print statistics by word length
+    # Open CSV file with context manager for automatic closing
+    with open(csv_file, 'w') as f:
+        # Write header
+        header = ['word', 'current_state', 'guessed_letters', 'q_values', 'chosen_letter', 'correct']
+        f.write(','.join(header) + '\n')
+        
+        with torch.no_grad():
+            for word in tqdm(val_words, desc="Analyzing validation words"):
+                length = len(word)
+                guessed_letters = set()
+                current_state = '_' * length
+                word_completed = False
+                wrong_guesses = 0
+                num_guesses = 0
+                word_letters = set(word)
+                
+                while len(guessed_letters) < 26 and wrong_guesses < 6:
+                    # Calculate vowel ratio
+                    known_vowels = sum(1 for c in word if c in 'aeiou' and c in guessed_letters)
+                    vowel_ratio = known_vowels / length
+                    
+                    state = {
+                        'current_state': current_state,
+                        'guessed_letters': sorted(list(guessed_letters)),
+                        'vowel_ratio': vowel_ratio
+                    }
+                    
+                    # Get input tensors
+                    char_indices, guessed, vowel_ratio = prepare_input(state)
+                    char_indices = char_indices.unsqueeze(0).to(DEVICE)
+                    guessed = guessed.unsqueeze(0).to(DEVICE)
+                    length_tensor = torch.tensor([length], dtype=torch.float32).to(DEVICE)
+                    vowel_ratio = torch.tensor([vowel_ratio], dtype=torch.float32).to(DEVICE)
+                    
+                    # Get prediction
+                    predictions = model(char_indices, guessed, length_tensor, vowel_ratio)
+                    
+                    # Get next letter (excluding already guessed letters)
+                    valid_preds = [(i, p.item()) for i, p in enumerate(predictions[0]) 
+                                  if chr(i + ord('a')) not in guessed_letters]
+                    next_letter = chr(max(valid_preds, key=lambda x: x[1])[0] + ord('a'))
+                    
+                    # Format Q-values for CSV
+                    q_values = {chr(i + ord('a')): f"{p.item():.4f}" 
+                              for i, p in enumerate(predictions[0])}
+                    q_values_str = repr(q_values).replace(',', ';')  # Avoid CSV confusion
+                    
+                    # Write prediction data
+                    row = [
+                        word,
+                        current_state,
+                        ''.join(sorted(guessed_letters)),
+                        q_values_str,
+                        next_letter,
+                        str(next_letter in word_letters)
+                    ]
+                    f.write(','.join(row) + '\n')
+                    
+                    # Update game state
+                    guessed_letters.add(next_letter)
+                    num_guesses += 1
+                    if next_letter not in word_letters:
+                        wrong_guesses += 1
+                    
+                    current_state = ''.join([c if c in guessed_letters else '_' for c in word])
+                    
+                    if '_' not in current_state:
+                        word_completed = True
+                        break
+                
+                # Update statistics
+                length = len(word)
+                word_length_stats[length]['total'] += 1
+                word_length_stats[length]['total_guesses'] += num_guesses
+                if word_completed and wrong_guesses < 6:
+                    word_length_stats[length]['completed'] += 1
+    
+    logging.info(f"Detailed predictions saved to: {csv_file}")
+    
+    # Print statistics
     logging.info("\nCompletion rates and average guesses by word length:")
+    
     total_completed = 0
     total_words = 0
     total_guesses = 0
@@ -1075,7 +1143,7 @@ def run_detailed_validation(model, val_words):
     logging.info(f"Completion rate: {overall_completion:.2%} ({total_completed}/{total_words})")
     logging.info(f"Average guesses: {overall_avg_guesses:.1f}")
     
-    return word_length_stats
+    return dict(word_length_stats)  # Convert defaultdict to regular dict before returning
 
 def evaluate_saved_model(model_path):
     """Load and evaluate a saved model"""
@@ -1106,6 +1174,72 @@ def evaluate_saved_model(model_path):
         raise
     finally:
         logging.info(f"Log file saved to: {log_file}")
+
+def validate_states(states, num_samples=5):
+    """Validate state data structure and tensor dimensions"""
+    logging.info(f"\nValidating {num_samples} random states...")
+    
+    if not states:
+        raise ValueError("States list is empty")
+    
+    # Sample random states
+    sample_states = random.sample(states, min(num_samples, len(states)))
+    
+    for i, state in enumerate(sample_states):
+        logging.info(f"\nChecking state {i+1}:")
+        
+        # Check required keys
+        required_keys = {'current_state', 'guessed_letters', 'original_word', 
+                        'vowel_ratio', 'target_distribution'}
+        missing_keys = required_keys - state.keys()
+        if missing_keys:
+            raise ValueError(f"Missing required keys: {missing_keys}")
+        
+        # Check if word is complete
+        if '_' not in state['current_state']:
+            raise ValueError(f"Found completed word state: {state['current_state']}")
+        
+        # Validate dimensions by preparing tensors
+        char_indices, guessed, vowel_ratio = prepare_input(state)
+        length = torch.tensor([len(state['current_state'])], dtype=torch.float32)
+        target = torch.tensor(list(state['target_distribution'].values()), dtype=torch.float32)
+        
+        # # Log tensor shapes
+        # logging.info(f"char_indices shape: {char_indices.shape}")
+        # logging.info(f"guessed shape: {guessed.shape}")
+        # logging.info(f"length shape: {length.shape}")
+        # logging.info(f"vowel_ratio: {vowel_ratio}")
+        # logging.info(f"target shape: {target.shape}")
+        
+        # Validate target distribution
+        target_sum = sum(state['target_distribution'].values())
+        if not 0.99 <= target_sum <= 1.01:  # Allow small floating point errors
+            raise ValueError(f"Target distribution sum = {target_sum}, should be 1.0")
+        
+        # Try tensor concatenation
+        try:
+            # Add batch dimension for testing
+            char_indices = char_indices.unsqueeze(0)  # [1, max_word_length]
+            guessed = guessed.unsqueeze(0)  # [1, 26]
+            length_encoding = torch.tensor([[int(x) for x in format(int(length.item()), '05b')]], 
+                                        dtype=torch.float32)  # [1, 5]
+            vowel_ratio = torch.tensor([[vowel_ratio]], dtype=torch.float32)  # [1, 1]
+            
+            # Test concatenation
+            combined = torch.cat([
+                char_indices.float(),  # [1, max_word_length]
+                guessed,  # [1, 26]
+                length_encoding,  # [1, 5]
+                vowel_ratio  # [1, 1]
+            ], dim=1)
+            
+            logging.info(f"Combined shape: {combined.shape}")
+            
+        except Exception as e:
+            raise ValueError(f"Tensor concatenation failed: {str(e)}")
+    
+    logging.info("\nAll validation checks passed!")
+    return True
 
 def main():
     # Add argument parsing
@@ -1140,6 +1274,10 @@ def main():
             
             save_data(train_states, val_states, val_words)
         
+        # Validate states before training
+        validate_states(train_states)
+        validate_states(val_states)
+
         if args.evaluate:
             evaluate_saved_model(args.evaluate)
             return

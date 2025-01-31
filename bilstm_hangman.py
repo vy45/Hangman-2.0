@@ -33,14 +33,18 @@ SIMULATION_CORRECT_GUESS_PROB = 0.5
 MIN_NGRAM_LENGTH = 3
 MAX_NGRAM_LENGTH = 5
 LEARNING_RATE = 0.001  # Default for BiLSTM
+QUICK_TEST = True
+EPOCHS = 3 if QUICK_TEST else 100
+COMPLETION_EVAL_WORDS = 1000 if QUICK_TEST else 10000
+
 
 class BiLSTMHangmanModel(nn.Module):
     def __init__(self, hidden_dim=128, embedding_dim=8, dropout_rate=0.4, use_batch_norm=False):
         super().__init__()
         self.use_batch_norm = use_batch_norm
         
-        # Embedding layer for characters (27 inputs: 0=mask, 1-26=a-z)
-        self.char_embedding = nn.Embedding(27, embedding_dim)
+        # Increase embedding dimension
+        self.char_embedding = nn.Embedding(27, embedding_dim * 2)
         
         # Length encoding dictionary (5-bit representation)
         self.length_encoding = {
@@ -48,51 +52,81 @@ class BiLSTMHangmanModel(nn.Module):
             for i in range(1, 33)  # Support lengths 1-32
         }
         
-        # Bidirectional LSTM
+        # Add layer normalization
+        self.layer_norm = nn.LayerNorm(hidden_dim * 2)  # *2 for bidirectional
+        
+        # Modify BiLSTM
         self.lstm = nn.LSTM(
-            input_size=embedding_dim,
-            hidden_size=hidden_dim // 2,  # Half size since bidirectional concatenates
+            input_size=embedding_dim * 2,
+            hidden_size=hidden_dim,
             num_layers=2,
             batch_first=True,
             bidirectional=True,
             dropout=0.2 if dropout_rate > 0 else 0
         )
         
-        # Batch normalization layers (optional)
+        # Attention layer - adjust size for bidirectional output
+        self.attention = nn.Linear(hidden_dim * 2, 1)
+        
+        # Add residual connections
+        self.residual_linear = nn.Linear(embedding_dim * 2, hidden_dim * 2)
+        
+        # Batch normalization layers
         if use_batch_norm:
-            self.bn1 = nn.BatchNorm1d(hidden_dim + 26 + 5 + 1)  # +1 for vowel ratio
+            self.bn1 = nn.BatchNorm1d(hidden_dim * 2 + 26 + 5 + 1)
             self.bn2 = nn.BatchNorm1d(hidden_dim)
         
         # Dropout layer
         self.dropout = nn.Dropout(dropout_rate)
         
-        # Attention layer
-        self.attention = nn.Linear(hidden_dim, 1)
-        
-        # Final dense layers
-        self.combine = nn.Linear(hidden_dim + 26 + 5 + 1, hidden_dim)  # +1 for vowel ratio
+        # Final dense layers - adjust input size
+        self.combine = nn.Linear(hidden_dim * 2 + 26 + 5 + 1, hidden_dim)
         self.output = nn.Linear(hidden_dim, 26)
+        
+        # Add weight initialization
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        """Initialize weights with smaller values"""
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
         
     def forward(self, word_state, guessed_letters, word_length, vowel_ratio):
         # Embed characters
-        embedded = self.char_embedding(word_state)  # [batch, seq_len, embed_dim]
+        embedded = self.char_embedding(word_state)  # [batch, seq_len, embed_dim*2]
+        
+        # Add residual connection
+        residual = self.residual_linear(embedded)
         
         # Process through BiLSTM
-        lstm_out, _ = self.lstm(embedded)  # [batch, seq_len, hidden_dim]
+        lstm_out, _ = self.lstm(embedded)  # [batch, seq_len, hidden_dim*2]
+        lstm_out = self.layer_norm(lstm_out + residual)  # Add residual and normalize
         
         # Attention mechanism
-        attention_weights = F.softmax(self.attention(lstm_out), dim=1)
-        attended = torch.sum(attention_weights * lstm_out, dim=1)
+        attention_scores = self.attention(lstm_out)  # [batch, seq_len, 1]
+        attention_weights = F.softmax(attention_scores, dim=1)
+        attended = torch.sum(attention_weights * lstm_out, dim=1)  # [batch, hidden_dim*2]
         
         # Get length encoding
         length_encoding = torch.stack([self.length_encoding[l.item()] for l in word_length])
+
+        # Fix vowel_ratio dimensions
+        if vowel_ratio.dim() == 1:
+            vowel_ratio = vowel_ratio.unsqueeze(-1)
+        elif vowel_ratio.dim() == 2 and vowel_ratio.size(1) > 1:
+            vowel_ratio = vowel_ratio.squeeze(-1).unsqueeze(-1)
         
         # Combine features
         combined_features = torch.cat([
-            attended,
-            guessed_letters,
-            length_encoding.to(attended.device),
-            vowel_ratio.unsqueeze(1)
+            attended,  # [batch_size, hidden_dim*2]
+            guessed_letters,  # [batch_size, 26]
+            length_encoding.to(attended.device),  # [batch_size, 5]
+            vowel_ratio  # [batch_size, 1]
         ], dim=1)
         
         # Apply batch norm if enabled
@@ -106,7 +140,7 @@ class BiLSTMHangmanModel(nn.Module):
             hidden = self.bn2(hidden)
         
         # Output probabilities
-        return F.softmax(self.output(hidden), dim=-1) 
+        return F.softmax(self.output(hidden), dim=-1)
     
 
 class EarlyStopping:
@@ -137,6 +171,9 @@ def load_and_preprocess_words(filename='words_250000_train.txt'):
     # Filter words
     words = [w for w in words if all(c in ALPHABET for c in w)]
     word_lengths = [len(w) for w in words]
+
+    if QUICK_TEST:
+        words = words[:10000]
     
     # Count frequency of each length
     length_counts = defaultdict(int)
@@ -727,12 +764,26 @@ def prepare_length_batches(train_states):
     
     return batches
 
-def train_model(model, train_states, val_states, val_words, epochs=100):
-    """Modified training loop for length-specific batches"""
-    logging.info(f"Starting training for {epochs} epochs")
+def calculate_loss(predictions, targets):
+    """Calculate loss with label smoothing and stability measures"""
+    # Add label smoothing
+    epsilon = 0.1
+    targets = (1 - epsilon) * targets + epsilon / targets.size(-1)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=0.001)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    # Add stability measures
+    predictions = torch.clamp(predictions, min=1e-7, max=1-1e-7)
+    
+    # KL divergence loss
+    return F.kl_div(predictions.log(), targets, reduction='batchmean')
+
+def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
+    """Modified training loop with improved stability measures"""
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
+    
+    # Add gradient clipping
+    max_grad_norm = 1.0
+    
     early_stopping = EarlyStopping(patience=4, min_delta=0.001)
     
     # Save best model
@@ -769,90 +820,50 @@ def train_model(model, train_states, val_states, val_words, epochs=100):
             total_loss = 0
             num_batches = 0
             
-            # Prepare and shuffle batches for this epoch
-            batches = prepare_length_batches(train_states)
-            random.shuffle(batches)  # Shuffle batch order
-            
-            batch_iterator = tqdm(
-                batches,
-                desc=f"Epoch {epoch + 1}/{epochs}",
-                leave=False
-            )
-            
-            for batch in batch_iterator:
-                # Prepare batch (all states have same length)
-                word_states = []
-                guessed_letters = []
-                lengths = []
-                vowel_ratios = []
-                targets = []
-                
-                for state in batch:
-                    char_indices, guessed, vowel_ratio = prepare_input(state)
-                    word_states.append(char_indices)
-                    guessed_letters.append(guessed)
-                    lengths.append(len(state['current_state']))
-                    vowel_ratios.append(vowel_ratio)
-                    targets.append(torch.tensor(
-                        list(state['target_distribution'].values()), 
-                        dtype=torch.float32
-                    ))
-                
-                # Stack tensors
-                word_states = torch.stack(word_states).to(DEVICE)
-                guessed_letters = torch.stack(guessed_letters).to(DEVICE)
-                lengths = torch.tensor(lengths).to(DEVICE)
-                vowel_ratios = torch.stack(vowel_ratios).to(DEVICE)
-                targets = torch.stack(targets).to(DEVICE)
-                
-                # Forward pass
+            for batch in train_batches:
                 optimizer.zero_grad()
+                
+                # ... prepare batch tensors ...
+                
                 predictions = model(word_states, guessed_letters, lengths, vowel_ratios)
+                loss = calculate_loss(predictions, targets)
                 
-                # Check predictions for NaN
-                if torch.isnan(predictions).any():
-                    logging.error("NaN detected in predictions!")
-                    continue
-                
-                loss = F.kl_div(predictions.log(), targets, reduction='batchmean')
-                
-                # Check for NaN loss
-                if torch.isnan(loss):
-                    logging.error(f"NaN loss detected at epoch {epoch + 1}, batch {num_batches}")
-                    continue
-                
-                # Backward pass with gradient clipping
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                # Monitor gradients and weights
-                grad_norm = 0
-                weight_norm = 0
-                for param in model.parameters():
-                    if param.grad is not None:
-                        grad_norm += param.grad.norm().item()
-                    weight_norm += param.data.norm().item()
-                
-                metrics['gradient_norms'].append(grad_norm)
-                metrics['weight_norms'].append(weight_norm)
-                
-                if grad_norm > 10:  # Alert if gradients are too large
-                    logging.warning(f"Large gradient norm detected: {grad_norm}")
-                
-                optimizer.step()
-                
-                total_loss += loss.item()
-                num_batches += 1
-                
-                batch_iterator.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'avg_loss': f'{total_loss/num_batches:.4f}',
-                    'grad_norm': f'{grad_norm:.2f}'
-                })
+                if not torch.isnan(loss):
+                    loss.backward()
+                    
+                    # Clip gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    
+                    # Check gradient norms
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+                    if grad_norm > max_grad_norm * 2:
+                        logging.warning(f"Large gradient norm: {grad_norm:.2f}")
+                    
+                    optimizer.step()
+                    
+                    total_loss += loss.item()
+                    num_batches += 1
+                else:
+                    logging.warning("NaN loss encountered, skipping batch")
             
-            # Validation
+            # Compute validation metrics
             val_loss = evaluate_model(model, val_states)
             completion_rate = calculate_completion_rate(model, val_words[:COMPLETION_EVAL_WORDS])
+            
+            # Update learning rate based on validation loss
+            scheduler.step(val_loss)
+            
+            # Log metrics
+            logging.info(f"\nEpoch {epoch + 1} Results:")
+            logging.info(f"Train Loss: {total_loss/num_batches:.4f}")
+            logging.info(f"Val Loss: {val_loss:.4f}")
+            logging.info(f"Completion Rate: {completion_rate:.2%}")
+            logging.info(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
+            
+            # Early stopping check
+            if optimizer.param_groups[0]['lr'] < 1e-6:
+                logging.info("Learning rate too small, stopping training")
+                break
             
             # Store metrics
             train_loss = total_loss / num_batches
@@ -878,8 +889,6 @@ def train_model(model, train_states, val_states, val_words, epochs=100):
                 logging.info(f"Early stopping triggered at epoch {epoch + 1}")
                 metrics['stopped_epoch'] = epoch + 1
                 break
-            
-            scheduler.step(val_loss)
             
     except Exception as e:
         logging.error(f"Training failed with error: {str(e)}", exc_info=True)
@@ -932,8 +941,26 @@ def evaluate_model(model, val_states):
             vowel_ratios = torch.stack(vowel_ratios).to(DEVICE)
             targets = torch.stack(targets).to(DEVICE)
             
+            # Get predictions
             predictions = model(word_states, guessed_letters, lengths, vowel_ratios)
-            loss = F.kl_div(predictions.log(), targets, reduction='batchmean')
+            
+            # Check for NaN in predictions
+            if torch.isnan(predictions).any():
+                logging.error("NaN detected in predictions during validation")
+                continue
+                
+            # Add small epsilon to prevent log(0)
+            epsilon = 1e-8
+            predictions = predictions.clamp(min=epsilon, max=1-epsilon)
+            
+            # Compute loss
+            loss = calculate_loss(predictions, targets)
+            
+            if torch.isnan(loss):
+                logging.error("NaN loss detected during validation")
+                logging.error(f"Predictions min/max: {predictions.min():.4f}/{predictions.max():.4f}")
+                logging.error(f"Targets min/max: {targets.min():.4f}/{targets.max():.4f}")
+                continue
             
             total_loss += loss.item()
             num_batches += 1
@@ -955,18 +982,26 @@ def calculate_completion_rate(model, words):
             word_letters = set(word)
             
             while len(guessed_letters) < 26 and wrong_guesses < 6:  # MAX_WRONG_GUESSES = 6
+                known_vowels = sum(1 for c in word if c in 'aeiou' and c in guessed_letters)
+                vowel_ratio = known_vowels / len(word)
+                
                 # Prepare input
                 state = {
                     'current_state': current_state,
-                    'guessed_letters': sorted(list(guessed_letters))
+                    'guessed_letters': sorted(list(guessed_letters)),
+                    'vowel_ratio': vowel_ratio  # Add vowel ratio to state
                 }
                 
                 char_indices, guessed, vowel_ratio = prepare_input(state)
-                char_indices = char_indices.unsqueeze(0).to(DEVICE)
-                guessed = guessed.unsqueeze(0).to(DEVICE)
+                
+                # Add batch dimension and convert to tensors
+                char_indices = char_indices.unsqueeze(0).to(DEVICE)  # [1, max_word_length]
+                guessed = guessed.unsqueeze(0).to(DEVICE)  # [1, 26]
+                length = torch.tensor([len(current_state)], dtype=torch.float32).to(DEVICE)  # [1]
+                vowel_ratio = vowel_ratio.unsqueeze(0).to(DEVICE)  # [1]
                 
                 # Get prediction
-                predictions = model(char_indices, guessed, torch.tensor([len(word)]), torch.tensor([vowel_ratio]))
+                predictions = model(char_indices, guessed, length, vowel_ratio)
                 valid_preds = [(i, p.item()) for i, p in enumerate(predictions[0]) 
                               if chr(i + ord('a')) not in guessed_letters]
                 next_letter = chr(max(valid_preds, key=lambda x: x[1])[0] + ord('a'))
@@ -1008,16 +1043,23 @@ def run_detailed_validation(model, val_words):
             num_guesses = 0
             
             while len(guessed_letters) < 26 and wrong_guesses < 6:
+                # Calculate vowel ratio
+                known_vowels = sum(1 for c in word if c in 'aeiou' and c in guessed_letters)
+                vowel_ratio = known_vowels / len(word)
+                
                 state = {
                     'current_state': current_state,
-                    'guessed_letters': sorted(list(guessed_letters))
+                    'guessed_letters': sorted(list(guessed_letters)),
+                    'vowel_ratio': vowel_ratio  # Add vowel ratio to state
                 }
                 
                 char_indices, guessed, vowel_ratio = prepare_input(state)
                 char_indices = char_indices.unsqueeze(0).to(DEVICE)
                 guessed = guessed.unsqueeze(0).to(DEVICE)
+                length = torch.tensor([len(word)], dtype=torch.float32).to(DEVICE)
+                vowel_ratio = torch.tensor([vowel_ratio], dtype=torch.float32).to(DEVICE)
                 
-                predictions = model(char_indices, guessed, torch.tensor([len(word)]), torch.tensor([vowel_ratio]))
+                predictions = model(char_indices, guessed, length, vowel_ratio)
                 valid_preds = [(i, p.item()) for i, p in enumerate(predictions[0]) 
                              if chr(i + ord('a')) not in guessed_letters]
                 next_letter = chr(max(valid_preds, key=lambda x: x[1])[0] + ord('a'))
