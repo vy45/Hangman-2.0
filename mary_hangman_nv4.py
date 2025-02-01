@@ -1,3 +1,73 @@
+#!/usr/bin/env python3
+
+import sys
+import subprocess
+import pkg_resources
+import logging
+from pathlib import Path
+
+def check_and_install_packages():
+    """Check if required packages are installed and install if missing"""
+    required = {
+        'torch': '2.0.0',
+        'numpy': '1.21.0',
+        'scikit-learn': '1.0.0',
+        'tqdm': '4.65.0',
+        'pandas': '1.3.0',
+        'matplotlib': '3.4.0',
+        'seaborn': '0.11.0',
+        'psutil': '5.9.0',
+        'torchinfo': '1.7.0'
+    }
+    
+    optional = {
+        'torch-geometric': '2.0.0',  # For GPU support
+        'pytest': '6.0.0',           # For testing
+        'black': '22.0.0',           # For code formatting
+        'pylint': '2.12.0'           # For code quality
+    }
+    
+    missing = []
+    missing_optional = []
+    
+    # Check installed packages
+    installed = {pkg.key: pkg.version for pkg in pkg_resources.working_set}
+    
+    # Check required packages
+    for package, min_version in required.items():
+        if package not in installed:
+            missing.append(f"{package}>={min_version}")
+        else:
+            current = pkg_resources.parse_version(installed[package])
+            required_ver = pkg_resources.parse_version(min_version)
+            if current < required_ver:
+                missing.append(f"{package}>={min_version}")
+    
+    # Check optional packages
+    for package, min_version in optional.items():
+        if package not in installed:
+            missing_optional.append(f"{package}>={min_version}")
+    
+    if missing:
+        print("Installing required packages...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
+            print("Required package installation complete!")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to install required packages: {str(e)}")
+            sys.exit(1)
+    
+    if missing_optional:
+        print("\nOptional packages are not installed. These might be useful:")
+        for pkg in missing_optional:
+            print(f"  {pkg}")
+        print("\nYou can install them with:")
+        print(f"pip install {' '.join(missing_optional)}")
+
+# Run package check before other imports
+if __name__ == "__main__":
+    check_and_install_packages()
+
 # Including Remaining Lives as a feature. 
 # more data, bigger model, bidirectional lstm. 
 
@@ -1038,7 +1108,7 @@ def calculate_completion_rate(model, words):
                 char_indices = char_indices.unsqueeze(0).to(DEVICE)  # [1, max_word_length]
                 guessed = guessed.unsqueeze(0).to(DEVICE)  # [1, 26]
                 length = torch.tensor([len(current_state)], dtype=torch.float32).to(DEVICE)  # [1]
-                vowel_ratio = vowel_ratio.unsqueeze(0).to(DEVICE)  # [1]
+                vowel_ratio = torch.tensor([vowel_ratio], dtype=torch.float32).to(DEVICE)  # [1]
                 lives = torch.tensor([lives], dtype=torch.float32).to(DEVICE)  # [1]
                 
                 # Get model prediction

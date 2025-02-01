@@ -21,7 +21,7 @@ def setup_logging():
     )
     return log_file
 
-def run_model(script_name, force_new_data=False):
+def run_model(script_name, force_new_data=False, timeout=7200):  # 2 hour timeout
     cmd = ['python', script_name]
     if force_new_data:
         cmd.append('--force-new-data')
@@ -34,11 +34,17 @@ def run_model(script_name, force_new_data=False):
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            universal_newlines=True
+            universal_newlines=True,
+            bufsize=1  # Line buffered
         )
         
-        # Stream output in real-time
+        # Stream output in real-time with timeout
         while True:
+            if time.time() - start_time > timeout:
+                process.kill()
+                logging.error(f"{script_name} timed out after {timeout} seconds")
+                return False
+                
             output = process.stdout.readline()
             if output == '' and process.poll() is not None:
                 break
