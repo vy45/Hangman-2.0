@@ -74,7 +74,7 @@ def main():
     
     try:
         # Run NV3 with force new data
-        if not run_model('mary_hangman_nv3.py', force_new_data=True):
+        if not run_model('mary_hangman_nv3.py'):
             raise Exception("NV3 training failed")
         
         # Run NV4 using NV3's data
