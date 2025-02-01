@@ -2,7 +2,12 @@
 
 import sys
 import subprocess
-import pkg_resources
+try:
+    import pkg_resources
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "setuptools"])
+    import pkg_resources
+
 import logging
 from pathlib import Path
 import platform

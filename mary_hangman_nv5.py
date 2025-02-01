@@ -11,6 +11,7 @@ except ImportError:
 import logging
 from pathlib import Path
 import platform
+import argparse
 
 def check_and_install_packages():
     """Check if required packages are installed and install if missing"""
@@ -1164,7 +1165,7 @@ def calculate_completion_rate(model, words):
                 char_indices = char_indices.unsqueeze(0).to(DEVICE)  # [1, max_word_length]
                 guessed = guessed.unsqueeze(0).to(DEVICE)  # [1, 26]
                 length = torch.tensor([len(current_state)], dtype=torch.float32).to(DEVICE)  # [1]
-                vowel_ratio = vowel_ratio.unsqueeze(0).to(DEVICE)  # [1]
+                vowel_ratio = torch.tensor([vowel_ratio], dtype=torch.float32).to(DEVICE)  # [1]
                 lives = torch.tensor([lives], dtype=torch.float32).to(DEVICE)  # [1]
                 
                 # Get model prediction
