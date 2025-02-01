@@ -2,14 +2,29 @@
 
 import sys
 import subprocess
-import pkg_resources
+try:
+    import pkg_resources
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "setuptools"])
+    import pkg_resources
+
 import logging
 from pathlib import Path
 import platform
 
 def check_and_install_packages():
     """Check if required packages are installed and install if missing"""
+    # First ensure setuptools is installed for pkg_resources
+    try:
+        import pkg_resources
+    except ImportError:
+        print("Installing setuptools...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "setuptools"])
+        import pkg_resources
+        print("setuptools installed successfully!")
+
     required = {
+        'setuptools': '41.0.0',  # Added setuptools as required
         'torch': '2.0.0',
         'numpy': '1.21.0',
         'scikit-learn': '1.0.0',
@@ -130,7 +145,7 @@ SIMULATION_CORRECT_GUESS_PROB = 0.5
 MIN_NGRAM_LENGTH = 3
 MAX_NGRAM_LENGTH = 5
 EPOCHS = 10 if QUICK_TEST else 100
-COMPLETION_EVAL_WORDS = 1000 if QUICK_TEST else 10000
+COMPLETION_EVAL_WORDS = 1000 if QUICK_TEST else 2000
 hidden_dim=512
 
 class MaryLSTMModel(nn.Module):

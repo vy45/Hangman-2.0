@@ -998,8 +998,12 @@ def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
             
             # Validation phase using length-specific batches
             model.eval()
-            val_loss = evaluate_model(model, val_states)  # This uses prepare_length_batches
-            completion_rate = calculate_completion_rate(model, val_words[:COMPLETION_EVAL_WORDS])
+            if (epoch + 1) % 4 == 0:
+                val_loss = evaluate_model(model, val_states)  # This uses prepare_length_batches
+                completion_rate = calculate_completion_rate(model, val_words[:COMPLETION_EVAL_WORDS])
+            else:
+                val_loss = evaluate_model(model, val_states[:COMPLETION_EVAL_WORDS])  # This uses prepare_length_batches
+                completion_rate = calculate_completion_rate(model, val_words[:COMPLETION_EVAL_WORDS])
             
             # Run detailed validation every 4 epochs
             if (epoch + 1) % 4 == 0:
