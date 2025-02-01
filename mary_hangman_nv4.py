@@ -12,6 +12,36 @@ import logging
 from pathlib import Path
 import platform
 import argparse
+from datetime import datetime
+
+# Set up logging immediately
+def setup_logging():
+    """Set up logging configuration"""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_dir = 'logs'
+    Path(log_dir).mkdir(exist_ok=True)
+    
+    model_name = Path(__file__).stem  # Gets the name of the current file without extension
+    log_file = f'{log_dir}/{model_name}_{timestamp}.log'
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    return log_file
+
+# Initialize logging before any logging calls
+if __name__ == "__main__":
+    log_file = setup_logging()
+
+import logging
+from pathlib import Path
+import platform
+import argparse
 
 def check_and_install_packages():
     """Check if required packages are installed and install if missing"""
