@@ -1,3 +1,90 @@
+#!/usr/bin/env python3
+
+import sys
+import subprocess
+import pkg_resources
+import logging
+from pathlib import Path
+import platform
+
+def check_and_install_packages():
+    """Check if required packages are installed and install if missing"""
+    required = {
+        'torch': '2.0.0',
+        'numpy': '1.21.0',
+        'scikit-learn': '1.0.0',
+        'tqdm': '4.65.0',
+        'pandas': '1.3.0',
+        'matplotlib': '3.4.0',
+        'seaborn': '0.11.0',
+        'psutil': '5.9.0',
+        'torchinfo': '1.7.0'
+    }
+    
+    optional = {
+        'torch-geometric': '2.0.0',  # For GPU support
+        'pytest': '6.0.0',           # For testing
+        'black': '22.0.0',           # For code formatting
+        'pylint': '2.12.0'           # For code quality
+    }
+    
+    missing = []
+    missing_optional = []
+    
+    # Check installed packages
+    installed = {pkg.key: pkg.version for pkg in pkg_resources.working_set}
+    
+    # Check required packages
+    for package, min_version in required.items():
+        if package not in installed:
+            missing.append(f"{package}>={min_version}")
+        else:
+            current = pkg_resources.parse_version(installed[package])
+            required_ver = pkg_resources.parse_version(min_version)
+            if current < required_ver:
+                missing.append(f"{package}>={min_version}")
+    
+    # Check optional packages
+    for package, min_version in optional.items():
+        if package not in installed:
+            missing_optional.append(f"{package}>={min_version}")
+    
+    if missing:
+        print("Installing required packages...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
+            print("Required package installation complete!")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to install required packages: {str(e)}")
+            sys.exit(1)
+    
+    if missing_optional:
+        print("\nOptional packages are not installed. These might be useful:")
+        for pkg in missing_optional:
+            print(f"  {pkg}")
+        print("\nYou can install them with:")
+        print(f"pip install {' '.join(missing_optional)}")
+    
+    # Check for MPS support on Apple Silicon
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                print("MPS (Metal Performance Shaders) is available - will use Apple Silicon GPU")
+            else:
+                print("MPS is not available. Please ensure you have:")
+                print("1. macOS 12.3 or later")
+                print("2. PyTorch 2.0 or later")
+                print("3. Proper PyTorch installation for Apple Silicon")
+                print("\nYou can install PyTorch for Apple Silicon with:")
+                print("pip3 install --pre torch torchvision torchaudio")
+        except Exception as e:
+            print(f"Error checking MPS availability: {str(e)}")
+
+# Run package check before other imports
+if __name__ == "__main__":
+    check_and_install_packages()
+
 # Including Remaining Lives as a feature. 
 # more data, bigger model, transformer
 
@@ -12,10 +99,6 @@ import pickle
 import os
 from tqdm import tqdm
 from datetime import datetime
-import sys
-from pathlib import Path
-import logging
-import argparse
 import traceback
 import torch.optim as optim
 import re
@@ -27,7 +110,14 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # Constants
 QUICK_TEST = False
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE = (
+    torch.device("mps") 
+    if torch.backends.mps.is_available() 
+    else torch.device("cuda") 
+    if torch.cuda.is_available() 
+    else torch.device("cpu")
+)
+logging.info(f"Using device: {DEVICE}")
 ALPHABET = 'abcdefghijklmnopqrstuvwxyz'
 BATCH_SIZE = 64
 DATA_DIR = 'hangman_data'

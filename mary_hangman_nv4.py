@@ -5,6 +5,7 @@ import subprocess
 import pkg_resources
 import logging
 from pathlib import Path
+import platform
 
 def check_and_install_packages():
     """Check if required packages are installed and install if missing"""
@@ -63,6 +64,22 @@ def check_and_install_packages():
             print(f"  {pkg}")
         print("\nYou can install them with:")
         print(f"pip install {' '.join(missing_optional)}")
+    
+    # Check for MPS support on Apple Silicon
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                print("MPS (Metal Performance Shaders) is available - will use Apple Silicon GPU")
+            else:
+                print("MPS is not available. Please ensure you have:")
+                print("1. macOS 12.3 or later")
+                print("2. PyTorch 2.0 or later")
+                print("3. Proper PyTorch installation for Apple Silicon")
+                print("\nYou can install PyTorch for Apple Silicon with:")
+                print("pip3 install --pre torch torchvision torchaudio")
+        except Exception as e:
+            print(f"Error checking MPS availability: {str(e)}")
 
 # Run package check before other imports
 if __name__ == "__main__":
@@ -96,7 +113,14 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # Constants
 QUICK_TEST = False
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE = (
+    torch.device("mps") 
+    if torch.backends.mps.is_available() 
+    else torch.device("cuda") 
+    if torch.cuda.is_available() 
+    else torch.device("cpu")
+)
+logging.info(f"Using device: {DEVICE}")
 ALPHABET = 'abcdefghijklmnopqrstuvwxyz'
 BATCH_SIZE = 64
 DATA_DIR = 'hangman_data'
