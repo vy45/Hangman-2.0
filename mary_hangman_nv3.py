@@ -162,7 +162,7 @@ SIMULATION_CORRECT_GUESS_PROB = 0.5
 MIN_NGRAM_LENGTH = 3
 MAX_NGRAM_LENGTH = 5
 EPOCHS = 10 if QUICK_TEST else 100
-COMPLETION_EVAL_WORDS = 1000 if QUICK_TEST else 10000
+COMPLETION_EVAL_WORDS = 1000 if QUICK_TEST else 2000
 
 class MaryLSTMModel(nn.Module):
     def __init__(self, hidden_dim=512, embedding_dim=64, dropout_rate=0.4, use_batch_norm=False):
@@ -1035,10 +1035,10 @@ def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
             model.eval()
             if (epoch + 1) % 4 == 0:
                 val_loss = evaluate_model(model, val_states)  # This uses prepare_length_batches
-                completion_rate = calculate_completion_rate(model, val_words[:COMPLETION_EVAL_WORDS])
+                # completion_rate = calculate_completion_rate(model, val_words[:COMPLETION_EVAL_WORDS])
             else:
-                val_loss = evaluate_model(model, val_states[:COMPLETION_EVAL_WORDS])  # This uses prepare_length_batches
-                completion_rate = calculate_completion_rate(model, val_words[:COMPLETION_EVAL_WORDS])
+                val_loss = evaluate_model(model, val_states)  # This uses prepare_length_batches[:COMPLETION_EVAL_WORDS]
+                # completion_rate = calculate_completion_rate(model, val_words[:COMPLETION_EVAL_WORDS])
             
             # Run detailed validation every 4 epochs
             if (epoch + 1) % 4 == 0:
