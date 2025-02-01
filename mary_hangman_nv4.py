@@ -1063,14 +1063,14 @@ def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
             
             # Store metrics
             metrics['val_loss'].append(val_loss)
-            metrics['completion_rate'].append(completion_rate)
+            # metrics['completion_rate'].append(completion_rate)
             metrics['train_loss'].append(total_loss / num_batches)
             
             # Log progress
             logging.info(f"\nEpoch {epoch + 1} Results:")
             logging.info(f"Train Loss: {total_loss / num_batches:.4f}")
             logging.info(f"Val Loss: {val_loss:.4f}")
-            logging.info(f"Completion Rate: {completion_rate:.2%}")
+            # logging.info(f"Completion Rate: {completion_rate:.2%}")
             logging.info(f"Average Gradient Norm: {np.mean(metrics['gradient_norms'][-num_batches:]):.2f}")
             logging.info(f"Average Weight Norm: {np.mean(metrics['weight_norms'][-num_batches:]):.2f}")
             
@@ -1483,7 +1483,7 @@ def main():
         logging.info("\nTraining complete!")
         logging.info(f"Model saved to: {model_path}")
         logging.info(f"Metrics saved to: {metrics_path}")
-        logging.info(f"Training completion rate: {metrics['completion_rate'][-1]:.2%}")
+        # logging.info(f"Training completion rate: {metrics['completion_rate'][-1]:.2%}")
         
     except Exception as e:
         logging.error(f"Training failed with error: {str(e)}")
