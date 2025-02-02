@@ -1,0 +1,32 @@
+# Core Python requirement
+python>=3.8.0; platform_system!="Darwin"  # for non-Mac systems
+python>=3.8.0; platform_system=="Darwin"  # for Mac systems
+
+# Core ML/DL
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch>=2.0.0; platform_system!="Darwin" # for non-Mac systems
+torch>=2.0.0; platform_system=="Darwin" and platform_machine=="arm64"  # for Apple Silicon
+numpy>=1.21.0
+scikit-learn>=1.0.0
+
+# Progress and Utilities
+tqdm>=4.65.0
+psutil>=5.9.0
+
+# Visualization and Monitoring
+torchinfo>=1.7.0
+
+# Optional GPU Support
+torch-geometric  # For GPU support if available
+
+# Data Processing
+pandas>=1.3.0  # For data manipulation
+matplotlib>=3.4.0  # For plotting metrics
+seaborn>=0.11.0  # For enhanced plotting
+
+# Development Tools (Optional)
+pytest>=6.0.0  # For testing
+black>=22.0.0  # For code formatting
+pylint>=2.12.0  # For code quality checks
+
+#for challa
