@@ -720,7 +720,7 @@ def setup_logging():
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_dir = Path('logs')
     log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / f'mary_hangman_{timestamp}.log'
+    log_file = log_dir / f'mary_hangman_v2_{timestamp}.log'
     
     # Configure logging to show DEBUG messages
     logging.basicConfig(
@@ -786,7 +786,7 @@ def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
     
     def save_checkpoint(epoch, val_loss):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        path = f'{DATA_DIR}/mary_model_epoch{epoch}_{timestamp}.pt'
+        path = f'{DATA_DIR}/mary_model_v2_epoch{epoch}_{timestamp}.pt'
         
         # Convert any defaultdicts in metrics to regular dicts before saving
         metrics_copy = metrics.copy()
@@ -1055,7 +1055,7 @@ def run_detailed_validation(model, val_words):
     # Create CSV filename with model type and timestamp
     model_type = model.__class__.__name__.replace('HangmanModel', '').lower()
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    csv_file = f'{DATA_DIR}/predictions_{model_type}_{timestamp}.csv'
+    csv_file = f'{DATA_DIR}/predictions_{model_type}_v2_{timestamp}.csv'
     
     # Open CSV file with context manager for automatic closing
     with open(csv_file, 'w') as f:
@@ -1321,8 +1321,8 @@ def main():
         
         # Save results
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        model_path = f'{DATA_DIR}/mary_model_{timestamp}.pt'
-        metrics_path = f'{DATA_DIR}/mary_metrics_{timestamp}.pkl'
+        model_path = f'{DATA_DIR}/mary_model_v2_{timestamp}.pt'
+        metrics_path = f'{DATA_DIR}/mary_metrics_v2_{timestamp}.pkl'
         
         # Now we have access to both model and optimizer
         torch.save({

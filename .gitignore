@@ -6,6 +6,7 @@
 !*.py
 !words_250000_train.txt
 !README.md
+!requirements.txt
 
 # Even if they are in subdirectories
 !*/

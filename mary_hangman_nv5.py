@@ -13,6 +13,7 @@ from pathlib import Path
 import platform
 import argparse
 from datetime import datetime
+import os
 
 # Set up logging immediately
 def setup_logging():
@@ -156,16 +157,13 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # Constants
 QUICK_TEST = False
-DEVICE = (
-    torch.device("mps") 
-    if torch.backends.mps.is_available() 
-    else torch.device("cuda") 
-    if torch.cuda.is_available() 
-    else torch.device("cpu")
-)
+# Use MPS if available, fallback to CPU for operations not supported by MPS
+DEVICE = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+FALLBACK_DEVICE = torch.device("cpu")  # For operations not supported by MPS
 logging.info(f"Using device: {DEVICE}")
+logging.info(f"Fallback device: {FALLBACK_DEVICE}")
 ALPHABET = 'abcdefghijklmnopqrstuvwxyz'
-BATCH_SIZE = 64
+BATCH_SIZE = 128 if torch.backends.mps.is_available() else 64
 DATA_DIR = 'hangman_data'
 VALIDATION_EPISODES = 10000
 FREQ_CUTOFF = 10
@@ -180,19 +178,11 @@ class MaryTransformerModel(nn.Module):
         super().__init__()
         self.use_batch_norm = use_batch_norm
         
-        # Embedding layer for characters (28 inputs: 0-25=a-z, 26=mask, 27=padding)
+        # Initialize components on CPU initially
         self.char_embedding = nn.Embedding(28, embedding_dim, padding_idx=27)
-        
-        # Length encoding dictionary (5-bit representation)
-        self.length_encoding = {
-            i: torch.tensor([int(x) for x in format(i, '05b')], dtype=torch.float32)
-            for i in range(1, 33)  # Support lengths 1-32
-        }
-        
-        # Positional Encoding
         self.pos_encoder = PositionalEncoding(embedding_dim, dropout_rate)
         
-        # Transformer Encoder
+        # Transformer components
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embedding_dim,
             nhead=nhead,
@@ -201,6 +191,15 @@ class MaryTransformerModel(nn.Module):
             batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Move components to appropriate device after initialization
+        self.to(DEVICE)
+        
+        # Length encoding dictionary (5-bit representation)
+        self.length_encoding = {
+            i: torch.tensor([int(x) for x in format(i, '05b')], dtype=torch.float32)
+            for i in range(1, 33)  # Support lengths 1-32
+        }
         
         # Batch normalization layers (optional)
         if use_batch_norm:
@@ -218,50 +217,52 @@ class MaryTransformerModel(nn.Module):
         # Get batch size
         batch_size = word_state.size(0)
         
-        # Embedding and positional encoding
+        # Normal forward pass without device switching
         embedded = self.char_embedding(word_state)  # [batch_size, seq_len, embedding_dim]
-        embedded = self.pos_encoder(embedded)
+        padding_mask = (word_state == 27)  # True where padding token (27) exists
         
-        # Create attention mask for padding
-        padding_mask = (word_state == 27)  # True for padding tokens
+        # Apply positional encoding
+        embedded = self.pos_encoder(embedded)  # [batch_size, seq_len, embedding_dim]
         
-        # Transformer processing
-        transformer_out = self.transformer(embedded, src_key_padding_mask=padding_mask)
+        # Run transformer
+        transformer_out = self.transformer(embedded, src_key_padding_mask=padding_mask)  # [batch_size, seq_len, embedding_dim]
         
-        # Get final output (use mean pooling over sequence length)
-        final_out = transformer_out.mean(dim=1)  # [batch_size, embedding_dim]
+        # Get final transformer output using mean pooling
+        final_transformer = transformer_out.mean(dim=1)  # [batch_size, embedding_dim]
         
-        # Create length encoding
+        # Prepare length encoding
         length_encoding = torch.stack([
             self.length_encoding[int(l.item())]
             for l in word_length
-        ]).to(final_out.device)
+        ])  # [batch_size, 5]
         
-        # Fix dimensions
-        if vowel_ratio.dim() == 1:
-            vowel_ratio = vowel_ratio.unsqueeze(-1)
-        if remaining_lives.dim() == 1:
-            remaining_lives = remaining_lives.unsqueeze(-1)
+        # Ensure all tensors have correct dimensions
+        guessed_letters = guessed_letters.float()  # [batch_size, 26]
+        vowel_ratio = vowel_ratio.view(batch_size, 1)  # [batch_size, 1]
+        remaining_lives = remaining_lives.view(batch_size, 1)  # [batch_size, 1]
         
-        # Concatenate features
-        combined_features = torch.cat([
-            final_out,  # [batch_size, embedding_dim]
-            guessed_letters,  # [batch_size, 26]
-            length_encoding,  # [batch_size, 5]
-            vowel_ratio,  # [batch_size, 1]
-            remaining_lives  # [batch_size, 1]
+        # Combine all features
+        combined = torch.cat([
+            final_transformer,  # [batch_size, embedding_dim]
+            guessed_letters,   # [batch_size, 26]
+            length_encoding,   # [batch_size, 5]
+            vowel_ratio,      # [batch_size, 1]
+            remaining_lives   # [batch_size, 1]
         ], dim=1)
         
-        # Apply batch norm if enabled
+        # Apply optional batch normalization
         if self.use_batch_norm:
-            combined_features = self.bn1(combined_features)
+            combined = self.bn1(combined)
         
-        # Dense layers
-        hidden = self.dropout(F.relu(self.combine(combined_features)))
+        # Final layers
+        x = self.combine(combined)
         if self.use_batch_norm:
-            hidden = self.bn2(hidden)
-            
-        return F.softmax(self.output(hidden), dim=-1)
+            x = self.bn2(x)
+        x = self.dropout(x)
+        x = F.relu(x)
+        x = self.output(x)
+        
+        return F.softmax(x, dim=1)
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=32):
@@ -313,7 +314,11 @@ class EarlyStopping:
 
 def load_and_preprocess_words(filename='words_250000_train.txt'):
     """Load words and split into train/validation sets"""
-    with open(filename, 'r') as f:
+    file_path = Path(filename)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Training data file not found: {filename}")
+        
+    with open(file_path, 'r') as f:
         words = [word.strip().lower() for word in f.readlines()]
     
     if QUICK_TEST:
@@ -954,47 +959,65 @@ def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
     """Modified training loop with curriculum learning"""
     logging.info(f"Starting training for {epochs} epochs")
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0003, weight_decay=0.001)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
-    early_stopping = EarlyStopping(patience=4, min_delta=0.001)
-    
-    # Save best model
-    best_val_loss = float('inf')
-    best_model_path = None
-    
-    # Track metrics
-    metrics = {
-        'train_loss': [],
-        'val_loss': [],
-        'completion_rate': [],
-        'total_time': 0,
-        'stopped_epoch': epochs,
-        'gradient_norms': [],
-        'weight_norms': []
-    }
-    
-    start_time = datetime.now()
-    
-    def save_checkpoint(epoch, val_loss):
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        path = f'{DATA_DIR}/mary_model_nv5_epoch{epoch}_{timestamp}.pt'
-        
-        # Convert any defaultdicts in metrics to regular dicts before saving
-        metrics_copy = metrics.copy()
-        for key in metrics_copy:
-            if isinstance(metrics_copy[key], defaultdict):
-                metrics_copy[key] = dict(metrics_copy[key])
-        
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_loss': val_loss,
-            'metrics': metrics_copy
-        }, path)
-        return path
+    # Clear GPU memory before training
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
     
     try:
+        # If QUICK_TEST, use only 10% of the data
+        if QUICK_TEST:
+            num_train = len(train_states) // 10
+            num_val = len(val_states) // 10
+            logging.info(f"QUICK_TEST: Using {num_train} training states and {num_val} validation states")
+            
+            # Randomly sample states to maintain distribution
+            train_indices = np.random.choice(len(train_states), num_train, replace=False)
+            val_indices = np.random.choice(len(val_states), num_val, replace=False)
+            
+            train_states = [train_states[i] for i in train_indices]
+            val_states = [val_states[i] for i in val_indices]
+            val_words = val_words[:len(val_words)//10]  # Also reduce validation words
+        
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.0003, weight_decay=0.001)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+        early_stopping = EarlyStopping(patience=4, min_delta=0.001)
+        
+        # Save best model
+        best_val_loss = float('inf')
+        best_model_path = None
+        
+        # Track metrics
+        metrics = {
+            'train_loss': [],
+            'val_loss': [],
+            'completion_rate': [],
+            'total_time': 0,
+            'stopped_epoch': epochs,
+            'gradient_norms': [],
+            'weight_norms': []
+        }
+        
+        start_time = datetime.now()
+        
+        def save_checkpoint(epoch, val_loss):
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            path = f'{DATA_DIR}/mary_model_nv5_epoch{epoch}_{timestamp}.pt'
+            
+            # Convert any defaultdicts in metrics to regular dicts before saving
+            metrics_copy = metrics.copy()
+            for key in metrics_copy:
+                if isinstance(metrics_copy[key], defaultdict):
+                    metrics_copy[key] = dict(metrics_copy[key])
+            
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'metrics': metrics_copy
+            }, path)
+            return path
+        
         for epoch in range(epochs):
             model.train()
             total_loss = 0
@@ -1119,6 +1142,11 @@ def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
         final_path = save_checkpoint('final', val_loss)
         logging.info(f"Final model saved to: {final_path}")
     
+    finally:
+        # Clear GPU memory after training
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    
     return model, optimizer, metrics
 
 def evaluate_model(model, val_states):
@@ -1198,7 +1226,7 @@ def calculate_completion_rate(model, words):
                 # Add batch dimension and convert to tensors
                 char_indices = char_indices.unsqueeze(0).to(DEVICE)  # [1, max_word_length]
                 guessed = guessed.unsqueeze(0).to(DEVICE)  # [1, 26]
-                length = torch.tensor([len(current_state)], dtype=torch.float32).to(DEVICE)  # [1]
+                length = torch.tensor([len(current_state)], dtype=torch.float32).to(DEVICE)
                 vowel_ratio = torch.tensor([vowel_ratio], dtype=torch.float32).to(DEVICE)  # [1]
                 lives = torch.tensor([lives], dtype=torch.float32).to(DEVICE)  # [1]
                 
@@ -1428,12 +1456,15 @@ def validate_states(states, num_samples=5):
     return True
 
 def main():
-    # Add argument parsing
     parser = argparse.ArgumentParser(description='Train Mary Hangman Model')
     parser.add_argument('--force-new-data', action='store_true', 
                        help='Force generation of new dataset even if one exists')
     parser.add_argument('--evaluate', type=str,
                        help='Path to model for evaluation')
+    parser.add_argument('--load-weights', type=str,
+                       help='Path to model weights to initialize from')
+    parser.add_argument('--latest-weights', action='store_true',
+                       help='Load the most recent model weights from data directory')
     args = parser.parse_args()
 
     # Setup logging
@@ -1442,6 +1473,15 @@ def main():
     logging.info(f"Using device: {DEVICE}")
     
     try:
+        # Ensure directories exist
+        ensure_directories()
+        
+        # Verify data files exist
+        required_files = ['words_250000_train.txt', 'words_test.txt']
+        for file in required_files:
+            if not Path(file).exists():
+                raise FileNotFoundError(f"Required file not found: {file}")
+        
         # Load or generate data
         train_states, val_states, val_words = load_data(force_new=args.force_new_data)
         
@@ -1460,6 +1500,17 @@ def main():
             
             save_data(train_states, val_states, val_words)
         
+        logging.info(f"Dataset sizes - Full:")
+        logging.info(f"Training states: {len(train_states)}")
+        logging.info(f"Validation states: {len(val_states)}")
+        logging.info(f"Validation words: {len(val_words)}")
+        
+        if QUICK_TEST:
+            logging.info(f"\nQUICK_TEST enabled - using 10% of data:")
+            logging.info(f"Training states: {len(train_states)//10}")
+            logging.info(f"Validation states: {len(val_states)//10}")
+            logging.info(f"Validation words: {len(val_words)//10}") 
+
         # Validate states before training
         validate_states(train_states)
         validate_states(val_states)
@@ -1470,6 +1521,31 @@ def main():
 
         # Initialize model
         model = MaryTransformerModel().to(DEVICE)
+        
+        # Load weights if specified
+        if args.latest_weights or args.load_weights:
+            if args.latest_weights:
+                # Find most recent model file
+                model_files = [f for f in os.listdir(DATA_DIR) if f.startswith('mary_model_nv5_') and f.endswith('.pt')]
+                if not model_files:
+                    logging.warning("No existing model weights found. Starting with fresh model.")
+                else:
+                    latest_model = max(model_files)
+                    weights_path = os.path.join(DATA_DIR, latest_model)
+                    logging.info(f"Loading latest model weights from: {weights_path}")
+            else:
+                weights_path = args.load_weights
+                logging.info(f"Loading model weights from: {weights_path}")
+            
+            try:
+                checkpoint = torch.load(weights_path, map_location=DEVICE)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                logging.info("Model weights loaded successfully!")
+            except Exception as e:
+                logging.error(f"Failed to load model weights: {str(e)}")
+                if not args.latest_weights:  # Only exit if specific weights were requested
+                    raise
+        
         num_params = sum(p.numel() for p in model.parameters())
         logging.info(f"Model initialized with {num_params:,} parameters")
         

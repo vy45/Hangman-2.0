@@ -1,30 +1,41 @@
-# Mary Hangman NV4
+# Mary Hangman NV5
 
-A deep learning model for playing Hangman using a bidirectional LSTM architecture.
+A deep learning model for playing Hangman using a transformer architecture.
+
+## Prerequisites
+
+- Python 3.8 or higher
+- For Apple Silicon Macs: macOS 12.3 or higher
 
 ## Setup
 
-1. Make sure you have Python 3.8+ installed
-2. Clone this repository
-3. Run the script:
+1. Clone this repository
+2. Ensure you have the required data files:
+   - words_250000_train.txt
+   - words_test.txt
+3. Install dependencies:
    ```bash
-   python mary_hangman_nv4.py
+   pip install -r requirements.txt
    ```
 
-The script will automatically check for and install required packages if they're missing.
+## Running the Model
 
-## Requirements
-
-- Python 3.8+
-- PyTorch 2.0.0+
-- NumPy 1.21.0+
-- scikit-learn 1.0.0+
-- tqdm 4.65.0+
+```bash
+python mary_hangman_nv5.py
+```
 
 ## Optional Arguments
 
 - `--force-new-data`: Force generation of new training data
 - `--evaluate MODEL_PATH`: Evaluate a saved model
+- `--load-weights PATH`: Load existing model weights
+- `--latest-weights`: Load the most recent model weights
+
+## Directory Structure
+
+The script will create:
+- `logs/`: Training logs
+- `hangman_data/`: Model checkpoints and data files
 
 ## Data
 

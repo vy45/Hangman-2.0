@@ -784,7 +784,7 @@ def load_data(force_new=False):
     data_dir = Path(DATA_DIR)
     data_dir.mkdir(exist_ok=True)
     
-    dataset_files = list(data_dir.glob('hangman_states_nv3_*.pkl'))
+    dataset_files = list(data_dir.glob('hangman_states_nv2_*.pkl'))
     if dataset_files and not force_new:
         latest_file = max(dataset_files, key=lambda p: p.stat().st_mtime)
         logging.info(f"Loading existing dataset: {latest_file}")
@@ -1414,6 +1414,10 @@ def main():
                        help='Force generation of new dataset even if one exists')
     parser.add_argument('--evaluate', type=str,
                        help='Path to model for evaluation')
+    parser.add_argument('--load-weights', type=str,
+                       help='Path to model weights to initialize from')
+    parser.add_argument('--latest-weights', action='store_true',
+                       help='Load the most recent model weights from data directory')
     args = parser.parse_args()
 
     # Setup logging
@@ -1450,6 +1454,31 @@ def main():
 
         # Initialize model
         model = MaryLSTMModel().to(DEVICE)
+
+         # Load weights if specified
+        if args.latest_weights or args.load_weights:
+            if args.latest_weights:
+                # Find most recent model file
+                model_files = [f for f in os.listdir(DATA_DIR) if f.startswith('mary_model_nv3_') and f.endswith('.pt')]
+                if not model_files:
+                    logging.warning("No existing model weights found. Starting with fresh model.")
+                else:
+                    latest_model = max(model_files)
+                    weights_path = os.path.join(DATA_DIR, latest_model)
+                    logging.info(f"Loading latest model weights from: {weights_path}")
+            else:
+                weights_path = args.load_weights
+                logging.info(f"Loading model weights from: {weights_path}")
+            
+            try:
+                checkpoint = torch.load(weights_path, map_location=DEVICE)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                logging.info("Model weights loaded successfully!")
+            except Exception as e:
+                logging.error(f"Failed to load model weights: {str(e)}")
+                if not args.latest_weights:  # Only exit if specific weights were requested
+                    raise
+
         num_params = sum(p.numel() for p in model.parameters())
         logging.info(f"Model initialized with {num_params:,} parameters")
         
