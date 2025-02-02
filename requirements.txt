@@ -1,6 +1,3 @@
-# Core Python requirement
-python>=3.8.0; platform_system!="Darwin"  # for non-Mac systems
-python>=3.8.0; platform_system=="Darwin"  # for Mac systems
 
 # Core ML/DL
 --find-links https://download.pytorch.org/whl/torch_stable.html
