@@ -1,12 +1,7 @@
 # Ignore everything
 *
 
-# But not these files...
-!.gitignore
-!*.py
-!words_250000_train.txt
-!README.md
-!requirements.txt
+
 
 # Even if they are in subdirectories
 !*/
@@ -178,3 +173,10 @@ checkpoints/
 # Keep specific files
 !p_analysis/validation_words.txt
 !p_analysis/summary_stats.csv
+
+# But not these files...
+!.gitignore
+!*.py
+!words_250000_train.txt
+!README.md
+!requirements.txt
