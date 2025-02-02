@@ -168,12 +168,14 @@ def get_char_mapping():
     return char_mapping
 
 def create_intermediate_data(df):
+    """Create and return intermediate data frame with word features"""
     x = pd.DataFrame(df.split('\n'))
     x[1] = x[0].apply(lambda p: len(p))
     x['vowels_present'] = x[0].apply(lambda p: set(p).intersection({'a', 'e', 'i', 'o', 'u'}))
     x['vowels_count'] = x['vowels_present'].apply(lambda p: len(p))
     x['unique_char_count'] = x[0].apply(lambda p: len(set(p)))
-    x_ = x[~((x['unique_char_count'].isin([0, 1, 2])) | (x[1] <= 3)) & (x.vowels_count != 0)]
+    # Filter and return the dataframe
+    return x[~((x['unique_char_count'].isin([0, 1, 2])) | (x[1] <= 3)) & (x.vowels_count != 0)]
 
 def read_data():
     """Read training data with error handling"""
@@ -228,17 +230,19 @@ def permute_consonents(word):
     return permuted_consonents
 
 def create_masked_dictionary(df_aug):
+    """Create dictionary of masked words"""
     masked_dictionary = {}
     counter = 0
     for word in df_aug[0]:
         all_masked_words_for_word = []
         all_masked_words_for_word = all_masked_words_for_word + permute_all(word)
-        all_masked_words_for_word = all_masked_words_for_word +  permute_consonents(word)
+        all_masked_words_for_word = all_masked_words_for_word + permute_consonents(word)
         all_masked_words_for_word = list(set(all_masked_words_for_word))
         masked_dictionary[word] = all_masked_words_for_word
         if counter % 10000 == 0:
-            print(f"Iteration {counter} completed")
+            logging.info(f"Iteration {counter} completed")
         counter = counter + 1
+    return masked_dictionary
 
 def get_vowel_prob(df_vowel, vowel):
     try:
@@ -323,16 +327,48 @@ def convert_to_tensor(input_data, target_data):
     return input_tensor, target_tensor
 
 def get_datasets():
-    df = read_data()
-    x_ = create_intermediate_data(df)
-    df_aug = x_.copy()
-    masked_dictionary = create_masked_dictionary(df_aug)
-    vowel_prior = get_vowel_prior(df_aug)
-    save_vowel_prior(vowel_prior)
-    input_data, target_data = encode_words(masked_dictionary)
-    save_input_output_data(input_data, target_data)
-    input_tensor, target_tensor = convert_to_tensor(input_data, target_data)
-    
+    """Get or create training datasets"""
+    try:
+        # Read raw data
+        df = read_data()
+        logging.info("Data file read successfully")
+        
+        # Create intermediate data
+        x_ = create_intermediate_data(df)
+        if x_ is None or len(x_) == 0:
+            raise ValueError("No valid data after intermediate processing")
+        logging.info(f"Created intermediate data with {len(x_)} entries")
+        
+        # Create masked dictionary
+        df_aug = x_.copy()
+        masked_dictionary = create_masked_dictionary(df_aug)
+        if not masked_dictionary:
+            raise ValueError("Failed to create masked dictionary")
+        logging.info(f"Created masked dictionary with {len(masked_dictionary)} entries")
+        
+        # Generate vowel prior probabilities
+        vowel_prior = get_vowel_prior(df_aug)
+        save_vowel_prior(vowel_prior)
+        logging.info("Saved vowel prior probabilities")
+        
+        # Encode words
+        input_data, target_data = encode_words(masked_dictionary)
+        if not input_data or not target_data:
+            raise ValueError("Failed to encode words")
+        logging.info(f"Encoded {len(input_data)} input/target pairs")
+        
+        # Save encoded data
+        save_input_output_data(input_data, target_data)
+        
+        # Convert to tensors
+        input_tensor, target_tensor = convert_to_tensor(input_data, target_data)
+        logging.info("Successfully created input and target tensors")
+        
+        return input_tensor, target_tensor
+        
+    except Exception as e:
+        logging.error(f"Dataset creation failed: {str(e)}")
+        raise
 
 def main():
     log_file = setup_logging()

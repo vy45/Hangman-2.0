@@ -15,9 +15,6 @@ __pycache__/
 *.pkl
 .ipynb_checkpoints/
 
-# Ignore logs directory
-logs/
-*.log
 
 # Ignore data directories
 data/
@@ -31,19 +28,6 @@ hangman_data/
 # OS files
 .DS_Store
 Thumbs.db
-
-# Data files
-*.pkl
-*.txt
-*.csv
-
-# Model files
-*.pt
-*.pth
-
-# Logs
-logs/
-*.log
 
 # Python cache
 __pycache__/
@@ -170,13 +154,10 @@ checkpoints/
 *.ckpt
 *.pth
 
-# Keep specific files
-!p_analysis/validation_words.txt
-!p_analysis/summary_stats.csv
-
 # But not these files...
 !.gitignore
 !*.py
 !words_250000_train.txt
 !README.md
 !requirements.txt
+!hangman_states_nv3_20250201_122702.pkl
