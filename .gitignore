@@ -160,4 +160,3 @@ checkpoints/
 !words_250000_train.txt
 !README.md
 !requirements.txt
-!hangman_states_nv3_20250201_122702.pkl
