@@ -23,10 +23,35 @@ from collections import Counter
 from multiprocessing import Pool
 import time
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import string
+
+def setup_logging():
+    """Setup logging configuration"""
+    if not hasattr(setup_logging, "initialized"):  # Only setup once
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_dir = Path('logs')
+        log_dir.mkdir(exist_ok=True)
+        log_file = log_dir / f'mary_hangman_v2_{timestamp}.log'
+        
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        setup_logging.initialized = True
+        logging.info("Logging setup complete. Log file: " + str(log_file))
+        return log_file
+    return None
 
 # Constants
 QUICK_TEST = False
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE = torch.device("mps") if torch.backends.mps.is_available() else (
+    torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+)
+FALLBACK_DEVICE = torch.device("cpu")  # For operations not supported by MPS
 ALPHABET = 'abcdefghijklmnopqrstuvwxyz'
 BATCH_SIZE = 64
 DATA_DIR = 'hangman_data'
@@ -38,13 +63,21 @@ MAX_NGRAM_LENGTH = 5
 EPOCHS = 3 if QUICK_TEST else 100
 COMPLETION_EVAL_WORDS = 1000 if QUICK_TEST else 10000
 
+# Log device info after logging is set up
+logging.info(f"Using device: {DEVICE}")
+if DEVICE.type == "mps":
+    logging.info("Running on Apple Silicon")
+    # Enable memory efficient attention if using transformers
+    if hasattr(torch.backends, "mps") and hasattr(torch.backends.mps, "enable_mem_efficient_sdp"):
+        torch.backends.mps.enable_mem_efficient_sdp(True)
+
 class MaryLSTMModel(nn.Module):
     def __init__(self, hidden_dim=128, embedding_dim=8, dropout_rate=0.4, use_batch_norm=False):
         super().__init__()
         self.use_batch_norm = use_batch_norm
         
-        # Embedding layer for characters (27 inputs: 0=mask, 1-26=a-z)
-        self.char_embedding = nn.Embedding(27, embedding_dim)
+        # Initialize components on CPU first
+        self.char_embedding = nn.Embedding(27, embedding_dim).to(FALLBACK_DEVICE)
         
         # Length encoding dictionary (5-bit representation)
         self.length_encoding = {
@@ -57,19 +90,22 @@ class MaryLSTMModel(nn.Module):
             input_size=embedding_dim,
             hidden_size=hidden_dim,
             batch_first=True
-        )
+        ).to(FALLBACK_DEVICE)
         
         # Batch normalization layers (optional)
         if use_batch_norm:
-            self.bn1 = nn.BatchNorm1d(hidden_dim + 26 + 5 + 2)  # +2 for vowel ratio and remaining lives
-            self.bn2 = nn.BatchNorm1d(hidden_dim)
+            self.bn1 = nn.BatchNorm1d(hidden_dim + 26 + 5 + 2).to(FALLBACK_DEVICE)  # +2 for vowel ratio and remaining lives
+            self.bn2 = nn.BatchNorm1d(hidden_dim).to(FALLBACK_DEVICE)
         
         # Dropout layer
-        self.dropout = nn.Dropout(dropout_rate)
+        self.dropout = nn.Dropout(dropout_rate).to(FALLBACK_DEVICE)
         
         # Final dense layers
-        self.combine = nn.Linear(hidden_dim + 26 + 5 + 2, hidden_dim)  # +2 for vowel ratio and remaining lives
-        self.output = nn.Linear(hidden_dim, 26)
+        self.combine = nn.Linear(hidden_dim + 26 + 5 + 2, hidden_dim).to(FALLBACK_DEVICE)  # +2 for vowel ratio and remaining lives
+        self.output = nn.Linear(hidden_dim, 26).to(FALLBACK_DEVICE)
+        
+        # Move entire model to target device after initialization
+        self.to(DEVICE)
         
     def forward(self, word_state, guessed_letters, word_length, vowel_ratio, remaining_lives):
         # Get batch size
@@ -360,7 +396,7 @@ def calculate_target_distribution(current_state, guessed_letters, original_word,
     
     # Then optionally add frequency information for short words
     if train_words is not None and word_length < FREQ_CUTOFF:
-        matching = get_matching_words(current_state, guessed_letters - set(current_state), train_words)
+        matching = get_matching_words(current_state, set(guessed_letters) - set(current_state), train_words)
         freqs = calculate_letter_frequencies(matching)
         freq_dist.update(freqs)
         
@@ -465,58 +501,97 @@ def time_block(description):
     
     return Timer(description)
 
-def calculate_target_distribution_wrapper(args):
-    """Wrapper function to unpack arguments for multiprocessing"""
-    current_state, guessed_letters, original_word, train_words, ngram_dict, is_validation, vowel_ratio = args
-    return calculate_target_distribution(
-        current_state, 
-        guessed_letters, 
-        original_word, 
-        train_words, 
-        ngram_dict, 
-        is_validation, 
-        vowel_ratio
-    )
-
-def generate_dataset(words, ngram_dict, is_validation=False, train_words=None):
-    """Generate dataset with balanced upsampling and target distributions"""
-    with time_block("Organizing words by length"):
-        # Pre-organize words by length for faster matching
-        words_by_length = defaultdict(list)
-        for word in words:
-            words_by_length[len(word)].append(word)
-        
-        # Pre-organize training words by length if needed for validation
-        train_words_by_length = None
-        if train_words:
-            train_words_by_length = defaultdict(list)
-            for word in train_words:
-                train_words_by_length[len(word)].append(word)
-        else:
-            # For training dataset, use words_by_length
-            train_words_by_length = words_by_length
-        
-        # Debug logging
-        # for length, words_list in train_words_by_length.items():
-            # logging.debug(f"Length {length}: {len(words_list)} training words available")
-    
+def generate_dataset(words, ngram_dict, num_games_per_word=5, is_validation=False, train_words=None):
+    """Generate dataset with balanced upsampling"""
     with time_block("Initial dataset generation"):
         logging.info("Generating initial dataset...")
         all_states = []
         length_counts = defaultdict(int)
         word_length_map = defaultdict(list)
         
-        # First pass: generate initial states
-        for word in tqdm(words, desc="Initial simulation"):
-            states = simulate_game_states(word)
-            all_states.extend(states)
+        # Generate initial states
+        for word in tqdm(words, desc="Generating game states"):
+            game_states = []
+            for _ in range(num_games_per_word):
+                current_state = ['_'] * len(word)
+                guessed_letters = []
+                remaining_lives = 6
+                
+                while remaining_lives > 0 and '_' in current_state:
+                    # Calculate current state info
+                    vowel_count = sum(1 for c in current_state if c in 'aeiou')
+                    vowel_ratio = vowel_count / len(current_state)
+                    
+                    # Calculate target distribution (only known missing letters)
+                    target_dist = {l: 0.0 for l in ALPHABET}
+                    remaining_letters = set(word) - set(guessed_letters)
+                    for letter in remaining_letters:
+                        target_dist[letter] = 1.0
+                    # Normalize
+                    total = sum(target_dist.values())
+                    if total > 0:
+                        target_dist = {k: v/total for k, v in target_dist.items()}
+                    
+                    # Record state
+                    state_info = {
+                        'current_state': ''.join(current_state),
+                        'guessed_letters': guessed_letters.copy(),
+                        'remaining_lives': remaining_lives,
+                        'vowel_ratio': vowel_ratio,
+                        'original_word': word,
+                        'target_distribution': target_dist
+                    }
+                    game_states.append(state_info)
+                    
+                    # Simulate guess
+                    available_letters = [c for c in string.ascii_lowercase if c not in guessed_letters]
+                    if not available_letters:
+                        break
+                    
+                    guess = random.choice(available_letters)
+                    guessed_letters.append(guess)
+                    
+                    if guess in word:
+                        for i, letter in enumerate(word):
+                            if letter == guess:
+                                current_state[i] = guess
+                    else:
+                        remaining_lives -= 1
+                
+                # Add final state with final target distribution
+                vowel_count = sum(1 for c in current_state if c in 'aeiou')
+                vowel_ratio = vowel_count / len(current_state)
+                
+                # Final target distribution
+                final_target_dist = {l: 0.0 for l in ALPHABET}
+                remaining_letters = set(word) - set(guessed_letters)
+                for letter in remaining_letters:
+                    final_target_dist[letter] = 1.0
+                # Normalize
+                total = sum(final_target_dist.values())
+                if total > 0:
+                    final_target_dist = {k: v/total for k, v in final_target_dist.items()}
+                
+                final_state = {
+                    'current_state': ''.join(current_state),
+                    'guessed_letters': guessed_letters.copy(),
+                    'remaining_lives': remaining_lives,
+                    'vowel_ratio': vowel_ratio,
+                    'original_word': word,
+                    'target_distribution': final_target_dist
+                }
+                game_states.append(final_state)
+            
+            # Add all states from this word
+            all_states.extend(game_states)
             length = len(word)
-            length_counts[length] += len(states)
+            length_counts[length] += len(game_states)
             word_length_map[length].append(word)
     
-    with time_block("Upsampling process"):
-        if not is_validation:
-            # Print initial statistics and calculate upsampling
+    # Handle upsampling if needed
+    if not is_validation:
+        with time_block("Upsampling process"):
+            # Print initial statistics
             total_states = len(all_states)
             logging.info("\nInitial state distribution:")
             for length in sorted(length_counts.keys()):
@@ -528,29 +603,33 @@ def generate_dataset(words, ngram_dict, is_validation=False, train_words=None):
                 else:
                     logging.info(f"Length {length:2d}: {count:6d} states ({percentage:.2%})")
             
-            # Upsample based on calculated factors
+            # Upsample underrepresented lengths
             upsampling_factors = calculate_upsampling_factors(length_counts)
             logging.info("\nUpsampling underrepresented lengths...")
             
-            for length, factor in upsampling_factors.items():
-                if factor > 1.0:
-                    current_count = length_counts[length]
-                    target_count = int(current_count * factor)
-                    additional_needed = target_count - current_count
-                    
-                    if additional_needed > 0:
-                        logging.info(f"\nLength {length} needs {additional_needed} more states")
-                        
-                        additional_states = []
-                        words = word_length_map[length]
-                        while len(additional_states) < additional_needed:
-                            word = random.choice(words)
-                            states = simulate_game_states(word)
-                            additional_states.extend(states)
-                        
-                        # Trim to exact number needed
-                        all_states.extend(additional_states[:additional_needed])
-                        length_counts[length] += additional_needed
+            additional_states = []
+            for length, factor in tqdm(upsampling_factors.items(), desc="Upsampling"):
+                if factor <= 1.0:
+                    continue
+                
+                current_count = length_counts[length]
+                target_count = int(current_count * factor)
+                additional_needed = target_count - current_count
+                
+                if additional_needed <= 0:
+                    continue
+                
+                words_of_length = word_length_map[length]
+                while len(additional_states) < additional_needed:
+                    word = random.choice(words_of_length)
+                    # Generate one more game for this word
+                    game_states = simulate_game_states(word)
+                    additional_states.extend(game_states)
+                
+                additional_states = additional_states[:additional_needed]
+            
+            # Add upsampled states
+            all_states.extend(additional_states)
             
             # Print final statistics
             total_states = len(all_states)
@@ -559,39 +638,6 @@ def generate_dataset(words, ngram_dict, is_validation=False, train_words=None):
                 count = length_counts[length]
                 percentage = count / total_states
                 logging.info(f"Length {length:2d}: {count:6d} states ({percentage:.2%})")
-                
-                if count < BATCH_SIZE:
-                    logging.warning(f"Length {length} has fewer than {BATCH_SIZE} states!")
-    
-    # with time_block("Target distribution calculation"):
-    #     # Calculate target distributions in parallel
-    #     with Pool() as pool:
-    #         # Prepare arguments as tuples
-    #         calc_args = [
-    #             (s['current_state'], 
-    #              set(s['guessed_letters']), 
-    #              s['original_word'],
-    #              # Only pass train_words for short words
-    #              train_words_by_length[len(s['current_state'])] if len(s['current_state']) < FREQ_CUTOFF else None,
-    #              None if is_validation else ngram_dict,
-    #              is_validation,
-    #              s['vowel_ratio'],
-    #              s['remaining_lives']) for s in all_states
-    #         ]
-            
-    #         target_dists = list(tqdm(
-    #             pool.imap(
-    #                 calculate_target_distribution_wrapper,
-    #                 calc_args,
-    #                 chunksize=100
-    #             ),
-    #             total=len(all_states),
-    #             desc="Calculating target distributions"
-    #         ))
-        
-        # Update states with calculated distributions
-        # for state, dist in zip(all_states, target_dists):
-        #     state['target_distribution'] = dist
     
     return all_states
 
@@ -619,59 +665,20 @@ def build_ngram_dictionary(words):
     # logging.info(f"Generated {len(ngram_dict)} unique n-grams")
     return ngram_dict
 
-# def simulate_game(word):
-#     """Simulate a single game and generate states"""
-#     states = []
-#     guessed_letters = set()
-#     word_letters = set(word)
-    
-#     while len(guessed_letters) < 26 and len(word_letters - guessed_letters) > 0:
-#         # Current word state
-#         current_state = ''.join([c if c in guessed_letters else '_' for c in word])
-        
-#         # Calculate target distribution (only unguessed correct letters)
-#         target_dist = {l: 0.0 for l in ALPHABET}
-#         remaining_letters = word_letters - guessed_letters
-#         for letter in remaining_letters:
-#             target_dist[letter] = 1.0
-        
-#         # Normalize distribution
-#         total = sum(target_dist.values())
-#         if total > 0:
-#             target_dist = {k: v/total for k, v in target_dist.items()}
-        
-#         # Store state
-#         states.append({
-#             'current_state': current_state,
-#             'guessed_letters': sorted(list(guessed_letters)),
-#             'target_distribution': target_dist
-#         })
-        
-#         # Simulate next guess
-#         if random.random() < SIMULATION_CORRECT_GUESS_PROB and remaining_letters:
-#             next_letter = random.choice(list(remaining_letters))
-#         else:
-#             available_letters = set(ALPHABET) - guessed_letters
-#             next_letter = random.choice(list(available_letters))
-        
-#         guessed_letters.add(next_letter)
-    
-#     return states
-
 def prepare_input(state):
-    """Prepare input tensors for model"""
+    """Prepare input tensors with proper device placement"""
     char_indices = torch.tensor([
         ALPHABET.index(c) if c in ALPHABET else 26 
         for c in state['current_state']
-    ], dtype=torch.long)
+    ], dtype=torch.long, device=DEVICE)
     
-    guessed = torch.zeros(26)
+    guessed = torch.zeros(26, device=DEVICE)
     for letter in state['guessed_letters']:
         if letter in ALPHABET:
             guessed[ALPHABET.index(letter)] = 1
             
-    vowel_ratio = torch.tensor([state['vowel_ratio']], dtype=torch.float32)
-    remaining_lives = torch.tensor([state['remaining_lives']], dtype=torch.float32) / 6.0  # Scale to [0,1]
+    vowel_ratio = torch.tensor([state['vowel_ratio']], dtype=torch.float32, device=DEVICE)
+    remaining_lives = torch.tensor([state['remaining_lives']], dtype=torch.float32, device=DEVICE) / 6.0
     
     return char_indices, guessed, vowel_ratio, remaining_lives
 
@@ -715,26 +722,6 @@ def load_data(force_new=False):
             return None, None, None
     return None, None, None
 
-def setup_logging():
-    """Setup logging configuration"""
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_dir = Path('logs')
-    log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / f'mary_hangman_v2_{timestamp}.log'
-    
-    # Configure logging to show DEBUG messages
-    logging.basicConfig(
-        level=logging.DEBUG,  # Changed from INFO to DEBUG
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    
-    logging.info("Logging setup complete. Log file: " + str(log_file))
-    return log_file
-
 def prepare_length_batches(train_states):
     """Organize training states into length-specific batches"""
     # Group states by word length
@@ -761,8 +748,12 @@ def prepare_length_batches(train_states):
     return batches
 
 def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
-    """Modified training loop for length-specific batches"""
+    """Modified training loop with curriculum learning and MPS optimizations"""
     logging.info(f"Starting training for {epochs} epochs")
+    
+    # Clear MPS memory before training
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
     
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0003, weight_decay=0.001)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
@@ -778,8 +769,8 @@ def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
         'completion_rate': [],
         'total_time': 0,
         'stopped_epoch': epochs,
-        'gradient_norms': [],  # Track gradient norms
-        'weight_norms': []     # Track weight norms
+        'gradient_norms': [],
+        'weight_norms': []
     }
     
     start_time = datetime.now()
@@ -804,6 +795,9 @@ def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
         return path
     
     try:
+        # Optimize batch size for MPS
+        effective_batch_size = BATCH_SIZE * 2 if DEVICE.type == "mps" else BATCH_SIZE
+        
         for epoch in range(epochs):
             model.train()
             total_loss = 0
@@ -811,7 +805,7 @@ def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
             
             # Prepare and shuffle batches for this epoch
             batches = prepare_length_batches(train_states)
-            random.shuffle(batches)  # Shuffle batch order
+            random.shuffle(batches)
             
             batch_iterator = tqdm(
                 batches,
@@ -840,7 +834,7 @@ def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
                         dtype=torch.float32
                     ))
                 
-                # Stack tensors
+                # Stack tensors and move to device
                 word_states = torch.stack(word_states).to(DEVICE)
                 guessed_letters = torch.stack(guessed_letters).to(DEVICE)
                 lengths = torch.tensor(lengths).to(DEVICE)
@@ -879,10 +873,14 @@ def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
                 metrics['gradient_norms'].append(grad_norm)
                 metrics['weight_norms'].append(weight_norm)
                 
-                if grad_norm > 10:  # Alert if gradients are too large
+                if grad_norm > 10:
                     logging.warning(f"Large gradient norm detected: {grad_norm}")
                 
                 optimizer.step()
+                
+                # Periodically clear MPS cache
+                if DEVICE.type == "mps" and num_batches % 100 == 0:
+                    torch.mps.empty_cache()
                 
                 total_loss += loss.item()
                 num_batches += 1
@@ -936,6 +934,10 @@ def train_model(model, train_states, val_states, val_words, epochs=EPOCHS):
         raise
     
     finally:
+        # Clear MPS memory after training
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        
         total_time = (datetime.now() - start_time).total_seconds()
         metrics['total_time'] = total_time
         logging.info(f"\nTraining completed in {total_time:.2f} seconds")
@@ -1220,32 +1222,20 @@ def validate_states(states, num_samples=5):
         if '_' not in state['current_state']:
             raise ValueError(f"Found completed word state: {state['current_state']}")
         
-        # Validate dimensions by preparing tensors
-        char_indices, guessed, vowel_ratio, lives = prepare_input(state)
-        length = torch.tensor([len(state['current_state'])], dtype=torch.float32)
-        target = torch.tensor(list(state['target_distribution'].values()), dtype=torch.float32)
-        
-        # # Log tensor shapes
-        # logging.info(f"char_indices shape: {char_indices.shape}")
-        # logging.info(f"guessed shape: {guessed.shape}")
-        # logging.info(f"length shape: {length.shape}")
-        # logging.info(f"vowel_ratio: {vowel_ratio}")
-        # logging.info(f"target shape: {target.shape}")
-        
-        # Validate target distribution
-        target_sum = sum(state['target_distribution'].values())
-        if not 0.99 <= target_sum <= 1.01:  # Allow small floating point errors
-            raise ValueError(f"Target distribution sum = {target_sum}, should be 1.0")
-        
-        # Try tensor concatenation
         try:
+            # Validate dimensions by preparing tensors
+            char_indices, guessed, vowel_ratio, lives = prepare_input(state)
+            length = torch.tensor([len(state['current_state'])], dtype=torch.float32, device=DEVICE)
+            target = torch.tensor(list(state['target_distribution'].values()), 
+                                dtype=torch.float32, device=DEVICE)
+            
             # Add batch dimension for testing
             char_indices = char_indices.unsqueeze(0)  # [1, max_word_length]
             guessed = guessed.unsqueeze(0)  # [1, 26]
             length_encoding = torch.tensor([[int(x) for x in format(int(length.item()), '05b')]], 
-                                        dtype=torch.float32)  # [1, 5]
-            vowel_ratio = torch.tensor([[vowel_ratio]], dtype=torch.float32)  # [1, 1]
-            lives = torch.tensor([[lives]], dtype=torch.float32)  # [1, 1]
+                                        dtype=torch.float32, device=DEVICE)  # [1, 5]
+            vowel_ratio = vowel_ratio.unsqueeze(0)  # [1, 1]
+            lives = lives.unsqueeze(0)  # [1, 1]
             
             # Test concatenation
             combined = torch.cat([
@@ -1258,14 +1248,21 @@ def validate_states(states, num_samples=5):
             
             logging.info(f"Combined shape: {combined.shape}")
             
+            # Validate target distribution
+            target_sum = sum(state['target_distribution'].values())
+            if not 0.99 <= target_sum <= 1.01:  # Allow small floating point errors
+                raise ValueError(f"Target distribution sum = {target_sum}, should be 1.0")
+            
         except Exception as e:
-            raise ValueError(f"Tensor concatenation failed: {str(e)}")
+            raise ValueError(f"State validation failed: {str(e)}")
     
     logging.info("\nAll validation checks passed!")
     return True
 
 def main():
-    # Add argument parsing
+    # Setup logging first
+    log_file = setup_logging()
+    
     parser = argparse.ArgumentParser(description='Train Mary Hangman Model')
     parser.add_argument('--force-new-data', action='store_true', 
                        help='Force generation of new dataset even if one exists')
@@ -1273,10 +1270,7 @@ def main():
                        help='Path to model for evaluation')
     args = parser.parse_args()
 
-    # Setup logging
-    log_file = setup_logging()
     logging.info("Starting Mary's Hangman training")
-    logging.info(f"Using device: {DEVICE}")
     
     try:
         # Load or generate data
@@ -1289,12 +1283,12 @@ def main():
             # # Build n-gram dictionary
             # with open('words_250000_train.txt', 'r') as f:
             #     words = [w.strip().lower() for w in f.readlines()]
-            # ngram_dict = build_ngram_dictionary(words)
+            # # ngram_dict = build_ngram_dictionary(words)
             ngram_dict = None
 
             # Generate datasets
-            train_states = generate_dataset(training_words, ngram_dict, is_validation=False, train_words=training_words)
-            val_states = generate_dataset(val_words, ngram_dict, is_validation=True, train_words=training_words)
+            train_states = generate_dataset(training_words, ngram_dict, num_games_per_word=5, is_validation=False)
+            val_states = generate_dataset(val_words, ngram_dict, num_games_per_word=5, is_validation=True)
             
             save_data(train_states, val_states, val_words)
         
