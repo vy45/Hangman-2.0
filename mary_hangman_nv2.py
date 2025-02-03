@@ -695,8 +695,8 @@ def prepare_padded_batch(batch):
     
     # Initialize tensors (on CPU)
     batch_size = len(batch)
-    word_states = torch.zeros(batch_size, 27, dtype=torch.long)  # Changed to long
-    guessed_letters = torch.zeros(batch_size, 26, dtype=torch.long)  # Changed to long
+    word_states = torch.zeros(batch_size, max_len, dtype=torch.long)  # Changed dimension and type
+    guessed_letters = torch.zeros(batch_size, 26, dtype=torch.long)
     lengths = torch.zeros(batch_size, dtype=torch.float32)
     vowel_ratios = torch.zeros(batch_size, dtype=torch.float32)
     remaining_lives = torch.zeros(batch_size, dtype=torch.float32)
@@ -704,11 +704,16 @@ def prepare_padded_batch(batch):
     
     # Fill tensors
     for i, state in enumerate(batch):
-        # Word state
+        # Word state - convert to indices for embedding
         for j, c in enumerate(state['current_state']):
-            if c != '_':
-                word_states[i, ord(c) - ord('a')] = 1
-        word_states[i, -1] = int(state['current_state'].count('_') / len(state['current_state']) * 100)
+            if c == '_':
+                word_states[i, j] = 26  # Mask token
+            else:
+                word_states[i, j] = ord(c) - ord('a')  # Letter indices 0-25
+        
+        # Pad remaining positions
+        if len(state['current_state']) < max_len:
+            word_states[i, len(state['current_state']):] = 27  # Padding token
         
         # Guessed letters
         for letter in state['guessed_letters']:
