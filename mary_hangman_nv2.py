@@ -24,8 +24,9 @@ import time
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # Constants
-QUICK_TEST = False
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+QUICK_TEST = True
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else 
+                     ("cuda" if torch.cuda.is_available() else "cpu"))
 ALPHABET = 'abcdefghijklmnopqrstuvwxyz'
 BATCH_SIZE = 64
 DATA_DIR = 'hangman_data'
@@ -38,7 +39,7 @@ EPOCHS = 10 if QUICK_TEST else 100
 COMPLETION_EVAL_WORDS = 1000 if QUICK_TEST else 10000
 
 class MaryLSTMModel(nn.Module):
-    def __init__(self, hidden_dim=128, embedding_dim=8, dropout_rate=0.4, use_batch_norm=False):
+    def __init__(self, hidden_dim=256, embedding_dim=32, dropout_rate=0.4, use_batch_norm=False):
         super().__init__()
         self.use_batch_norm = use_batch_norm
         
@@ -1003,38 +1004,40 @@ def evaluate_model(model, val_states):
     return total_loss / num_batches if num_batches > 0 else float('inf')
 
 def calculate_completion_rate(model, words):
-    """Calculate word completion rate"""
+    """Calculate word completion rate using HangmanAPI"""
     model.eval()
     completed = 0
     total = len(words)
+    hangman_api = HangmanAPI(auth_token="e8f5c563cddaa094b31cb7c6581e47")
     
     with torch.no_grad():
-        for word in tqdm(words, desc="Calculating completion rate"):
+        for _ in tqdm(range(total), desc="Calculating completion rate"):
+            game_state = hangman_api.start_new_game()
+            word_state = game_state['word_state']
+            remaining_guesses = game_state['remaining_guesses']
             guessed_letters = set()
-            current_state = '_' * len(word)
-            wrong_guesses = 0
             
-            while wrong_guesses < 6 and '_' in current_state:
+            while remaining_guesses > 0 and '_' in word_state:
                 # Calculate vowel ratio
-                known_vowels = sum(1 for c in word if c in 'aeiou' and c in guessed_letters)
-                vowel_ratio = known_vowels / len(word)
+                known_vowels = sum(1 for c in word_state if c in 'aeiou' and c != '_')
+                vowel_ratio = known_vowels / len(word_state)
                 
                 # Prepare input
                 state = {
-                    'current_state': current_state,
+                    'current_state': word_state,
                     'guessed_letters': sorted(list(guessed_letters)),
-                    'vowel_ratio': vowel_ratio,  # Add vowel ratio to state
-                    'remaining_lives': 6 - wrong_guesses
+                    'vowel_ratio': vowel_ratio,
+                    'remaining_lives': remaining_guesses
                 }
                 
                 char_indices, guessed, vowel_ratio, lives = prepare_input(state)
                 
                 # Add batch dimension and convert to tensors
-                char_indices = char_indices.unsqueeze(0).to(DEVICE)  # [1, max_word_length]
-                guessed = guessed.unsqueeze(0).to(DEVICE)  # [1, 26]
-                length = torch.tensor([len(current_state)], dtype=torch.float32).to(DEVICE)  # [1]
-                vowel_ratio = vowel_ratio.unsqueeze(0).to(DEVICE)  # [1]
-                lives = torch.tensor([lives], dtype=torch.float32).to(DEVICE)  # [1]
+                char_indices = char_indices.unsqueeze(0).to(DEVICE)
+                guessed = guessed.unsqueeze(0).to(DEVICE)
+                length = torch.tensor([len(word_state)], dtype=torch.float32).to(DEVICE)
+                vowel_ratio = vowel_ratio.unsqueeze(0).to(DEVICE)
+                lives = lives.unsqueeze(0).to(DEVICE)
                 
                 # Get model prediction
                 predictions = model(char_indices, guessed, length, vowel_ratio, lives)
@@ -1044,15 +1047,15 @@ def calculate_completion_rate(model, words):
                               if chr(i + ord('a')) not in guessed_letters]
                 next_letter = chr(max(valid_preds, key=lambda x: x[1])[0] + ord('a'))
                 
-                # Update game state
+                # Make guess
+                game_state = hangman_api.make_guess(next_letter)
+                word_state = game_state['word_state']
+                remaining_guesses = game_state['remaining_guesses']
                 guessed_letters.add(next_letter)
-                if next_letter in word:
-                    current_state = ''.join(c if c in guessed_letters else '_' for c in word)
-                else:
-                    wrong_guesses += 1
-            
-            if '_' not in current_state:
-                completed += 1
+                
+                if game_state['game_won']:
+                    completed += 1
+                    break
     
     return completed / total
 

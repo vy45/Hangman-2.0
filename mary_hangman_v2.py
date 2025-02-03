@@ -497,7 +497,7 @@ def time_block(description):
     
     return Timer(description)
 
-def generate_dataset(words, ngram_dict, num_games_per_word=5, is_validation=False, train_words=None):
+def generate_dataset(words, ngram_dict, num_games_per_word=1, is_validation=False, train_words=None):
     """Generate dataset with balanced upsampling"""
     with time_block("Initial dataset generation"):
         logging.info("Generating initial dataset...")
@@ -1293,11 +1293,11 @@ def main():
             
             # Add logging to track dataset generation
             logging.info(f"Generating training states for {len(training_words)} words...")
-            train_states = generate_dataset(training_words, ngram_dict, num_games_per_word=5, is_validation=False)
+            train_states = generate_dataset(training_words, ngram_dict, num_games_per_word=1, is_validation=False)
             logging.info(f"Generated {len(train_states)} training states")
             
             logging.info(f"Generating validation states for {len(val_words)} words...")
-            val_states = generate_dataset(val_words, ngram_dict, num_games_per_word=5, is_validation=True)
+            val_states = generate_dataset(val_words, ngram_dict, num_games_per_word=1, is_validation=True)
             logging.info(f"Generated {len(val_states)} validation states")
             
             # Verify states before saving
