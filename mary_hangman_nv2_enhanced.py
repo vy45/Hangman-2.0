@@ -15,20 +15,31 @@ from mary_hangman_nv2 import (
     prepare_length_batches, prepare_padded_batch
 )
 import torch.nn.functional as F
+import os
+import pandas as pd
 
 # Constants
-QUICK_TEST = True  # Set to True to use only 10% of data
+QUICK_TEST = False  # Set to True to use only 10% of data
 DATA_DIR = 'hangman_data'
+
 
 # Modify logging setup
 def setup_logging():
     """Setup logging configuration"""
+    # Create logs directory if it doesn't exist
+    log_dir = os.path.join(os.getcwd(), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Create log file with timestamp
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    log_file = os.path.join(log_dir, f'training_{timestamp}.log')
+    
     # Remove any existing handlers
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
     
     # Configure file handler with detailed logging
-    file_handler = logging.FileHandler('training.log')
+    file_handler = logging.FileHandler(log_file)
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(
         '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
@@ -43,6 +54,9 @@ def setup_logging():
     logging.getLogger().setLevel(logging.DEBUG)
     logging.getLogger().addHandler(file_handler)
     logging.getLogger().addHandler(console_handler)
+    
+    logging.info(f"Log file created at: {log_file}")
+    return log_file
 
 # Call setup_logging at the start
 setup_logging()
@@ -60,129 +74,73 @@ class Timer:
         self.duration = self.end - self.start
         logging.info(f"{self.name} took {self.duration:.2f} seconds")
 
-def evaluate_model_with_api(model, num_practice_games=100):
+def log_game_to_df(game_data):
+    """Convert game data to DataFrame row"""
+    return pd.DataFrame([game_data])
+
+def evaluate_model_with_api(model, num_practice_games=100, epoch=0):
     if QUICK_TEST:
         num_practice_games = 10
         
     logging.info(f"Starting API evaluation with {num_practice_games} games")
+    
+    # Create DataFrame to store all game data
+    games_data = []
+    
     with Timer("API Evaluation"):
         api = ModelHangmanAPI(model=model, access_token="e8f5c563cddaa094b31cb7c6581e47")
         wins = 0
         
         for game_num in tqdm(range(num_practice_games), desc="Evaluating games"):
             try:
-                # Reset guessed letters for new game
-                api.guessed_letters = []
-                logging.debug(f"\nStarting Game {game_num + 1}")
-                
-                # Start new game
                 success = api.start_game(practice=True, verbose=False)
-                word_state = api.word_state
-                logging.debug(f"Initial word state: {word_state}")
                 
-                while api.remaining_lives > 0 and '_' in word_state:
-                    # Calculate vowel ratio
-                    known_vowels = sum(1 for c in word_state if c in 'aeiou' and c != '_')
-                    vowel_ratio = known_vowels / len(word_state)
-                    
-                    # Print current game state (debug level)
-                    logging.debug(f"\nCurrent state: {word_state}")
-                    logging.debug(f"Guessed letters: {sorted(api.guessed_letters)}")
-                    logging.debug(f"Remaining lives: {api.remaining_lives}")
-                    logging.debug(f"Vowel ratio: {vowel_ratio:.3f}")
-                    
-                    # Prepare input
-                    state = {
-                        'current_state': word_state,
-                        'guessed_letters': sorted(list(api.guessed_letters)),
-                        'vowel_ratio': vowel_ratio,
-                        'remaining_lives': api.remaining_lives
-                    }
-                    
-                    # Get model prediction
-                    char_indices, guessed, vowel_ratio, lives = prepare_input(state)
-                    char_indices = char_indices.unsqueeze(0).to(DEVICE)
-                    guessed = guessed.unsqueeze(0).to(DEVICE)
-                    length = torch.tensor([len(word_state)], dtype=torch.float32).to(DEVICE)
-                    vowel_ratio = vowel_ratio.unsqueeze(0).to(DEVICE)
-                    lives = lives.unsqueeze(0).to(DEVICE)
-                    
-                    with torch.no_grad():
-                        predictions = model(char_indices, guessed, length, vowel_ratio, lives)
-                    
-                    # Log Q-values
-                    q_values = {chr(i + ord('a')): f"{p.item():.4f}" 
-                              for i, p in enumerate(predictions[0])}
-                    logging.debug("Q-values for unguessed letters:")
-                    for letter, value in sorted(q_values.items()):
-                        if letter not in api.guessed_letters:
-                            logging.debug(f"  {letter}: {value}")
-                    
-                    # Choose next letter
-                    valid_preds = [(i, p.item()) for i, p in enumerate(predictions[0])
-                                  if chr(i + ord('a')) not in api.guessed_letters]
-                    next_letter = chr(max(valid_preds, key=lambda x: x[1])[0] + ord('a'))
-                    logging.debug(f"Chosen letter: {next_letter}")
-                    
-                    # Make guess
-                    api.guessed_letters.append(next_letter)
-                    result = api.make_guess(next_letter)
-                    word_state = result['word']
-                    
-                    if '_' not in word_state:  # Win condition
-                        wins += 1
-                        logging.debug(f"\nGame {game_num + 1} WON! Final word: {word_state}")
-                        break
+                # Get game data from API object
+                game_data = api.game_data
+                game_data.update({
+                    'game_num': game_num,
+                    'success': success,
+                    'epoch': epoch
+                })
+                games_data.append(game_data)
                 
-                if '_' in word_state:
-                    logging.debug(f"\nGame {game_num + 1} LOST. Final word state: {word_state}")
-                
-                logging.debug("-" * 50)
-                
+                if success:
+                    wins += 1
             except Exception as e:
                 logging.error(f"Error in game {game_num}: {str(e)}")
                 continue
+    
+    # Save games data to CSV
+    df = pd.DataFrame(games_data)
+    csv_dir = os.path.join(os.getcwd(), 'game_logs')
+    os.makedirs(csv_dir, exist_ok=True)
+    csv_path = os.path.join(csv_dir, f'api_games_epoch_{epoch}.csv')
+    df.to_csv(csv_path, index=False)
+    logging.info(f"API games data saved to {csv_path}")
     
     final_rate = wins / num_practice_games
     logging.info(f"Evaluation complete. Final win rate: {final_rate:.2%}")
     return final_rate
 
-def run_detailed_evaluation(model, val_words, max_words=5):
+def run_detailed_evaluation(model, val_words, max_words=5, epoch=0):
     """Run detailed evaluation on validation words with comprehensive logging"""
     logging.info("\nStarting Detailed Evaluation")
-    stats = {
-        'total_games': 0,
-        'wins': 0,
-        'total_guesses': 0,
-        'correct_guesses': 0,
-        'wrong_guesses': 0,
-        'by_length': defaultdict(lambda: {'total': 0, 'wins': 0, 'guesses': 0})
-    }
+    
+    eval_data = []
     
     for word_idx, word in enumerate(val_words):
         if word_idx >= max_words:
             break
             
-        logging.info(f"\n{'='*50}")
-        logging.info(f"Evaluating word {word_idx + 1}: {word}")
-        
         current_state = '_' * len(word)
         guessed_letters = set()
         wrong_guesses = 0
-        total_guesses = 0
         word_letters = set(word)
         
         while wrong_guesses < 6 and '_' in current_state:
-            # Calculate vowel ratio
+            # Calculate features
             known_vowels = sum(1 for c in word if c in 'aeiou' and c in guessed_letters)
             vowel_ratio = known_vowels / len(word)
-            
-            # Print current game state
-            logging.info(f"\nTurn {total_guesses + 1}")
-            logging.info(f"Current state: {current_state}")
-            logging.info(f"Guessed letters: {sorted(guessed_letters)}")
-            logging.info(f"Remaining lives: {6 - wrong_guesses}")
-            logging.info(f"Vowel ratio: {vowel_ratio:.3f}")
             
             # Prepare input
             state = {
@@ -203,56 +161,46 @@ def run_detailed_evaluation(model, val_words, max_words=5):
                 
                 predictions = model(char_indices, guessed, length, vowel_ratio, lives)
             
-            # Log Q-values
-            q_values = {chr(i + ord('a')): f"{p.item():.4f}" 
-                       for i, p in enumerate(predictions[0])}
-            logging.info("\nQ-values for unguessed letters:")
-            for letter, value in sorted(q_values.items()):
-                if letter not in guessed_letters:
-                    logging.info(f"  {letter}: {value}")
+            # Get Q-values
+            q_values = {chr(i + ord('a')): p.item() for i, p in enumerate(predictions[0])}
             
             # Choose next letter
             valid_preds = [(i, p.item()) for i, p in enumerate(predictions[0])
                           if chr(i + ord('a')) not in guessed_letters]
             next_letter = chr(max(valid_preds, key=lambda x: x[1])[0] + ord('a'))
             
-            logging.info(f"\nChosen letter: {next_letter}")
+            # Store turn data
+            turn_data = {
+                'epoch': epoch,
+                'word': word,
+                'word_idx': word_idx,
+                'current_state': current_state,
+                'guessed_letters': sorted(list(guessed_letters)),
+                'q_values': q_values,
+                'chosen_letter': next_letter,
+                'vowel_ratio': vowel_ratio,
+                'word_length': len(word),
+                'remaining_lives': 6 - wrong_guesses,
+                'is_correct': next_letter in word_letters
+            }
+            eval_data.append(turn_data)
             
             # Update game state
             guessed_letters.add(next_letter)
-            total_guesses += 1
-            
             if next_letter in word_letters:
-                stats['correct_guesses'] += 1
                 current_state = ''.join(c if c in guessed_letters else '_' for c in word)
-                logging.info(f"Correct guess! New state: {current_state}")
             else:
                 wrong_guesses += 1
-                stats['wrong_guesses'] += 1
-                logging.info(f"Wrong guess. Lives remaining: {6 - wrong_guesses}")
-        
-        # Update statistics
-        stats['total_games'] += 1
-        stats['total_guesses'] += total_guesses
-        stats['by_length'][len(word)]['total'] += 1
-        stats['by_length'][len(word)]['guesses'] += total_guesses
-        
-        if '_' not in current_state:
-            stats['wins'] += 1
-            stats['by_length'][len(word)]['wins'] += 1
-            logging.info(f"\nWord completed: {word}")
-        else:
-            logging.info(f"\nFailed to complete word. Final state: {current_state}")
     
-    # Print summary statistics
-    logging.info("\n" + "="*50)
-    logging.info("Detailed Evaluation Summary:")
-    logging.info(f"Total words evaluated: {stats['total_games']}")
-    logging.info(f"Win rate: {stats['wins']/stats['total_games']:.2%}")
-    logging.info(f"Average guesses per word: {stats['total_guesses']/stats['total_games']:.2f}")
-    logging.info(f"Guess accuracy: {stats['correct_guesses']/(stats['correct_guesses'] + stats['wrong_guesses']):.2%}")
+    # Save evaluation data to CSV
+    df = pd.DataFrame(eval_data)
+    csv_dir = os.path.join(os.getcwd(), 'game_logs')
+    os.makedirs(csv_dir, exist_ok=True)
+    csv_path = os.path.join(csv_dir, f'detailed_eval_epoch_{epoch}.csv')
+    df.to_csv(csv_path, index=False)
+    logging.info(f"Detailed evaluation data saved to {csv_path}")
     
-    return stats
+    return df
 
 def train_model():
     logging.info("Starting training process")
@@ -332,12 +280,12 @@ def train_model():
             
             # Evaluate using HangmanAPI
             model.eval()
-            completion_rate = evaluate_model_with_api(model)
+            completion_rate = evaluate_model_with_api(model, epoch=epoch)
             logging.info(f"Epoch {epoch+1} - Completion Rate: {completion_rate:.4f}")
             
             # Run detailed evaluation every 2 epochs
             if (epoch + 1) % 2 == 0:
-                detailed_stats = run_detailed_evaluation(model, data['val_words'][:100])
+                detailed_stats = run_detailed_evaluation(model, data['val_words'][:100], epoch=epoch)
                 logging.info(f"Epoch {epoch+1} - Detailed Evaluation Stats: {detailed_stats}")
             
             # Early stopping
@@ -359,25 +307,69 @@ class ModelHangmanAPI(HangmanAPI):
     def __init__(self, model, access_token=None):
         super().__init__(access_token=access_token)
         self.model = model
-        self.guessed_letters = []
-        self.word_state = None
-        self.remaining_lives = 6
+        self.game_data = {
+            'states': [],
+            'guessed_letters': [],
+            'q_values': [],
+            'chosen_letters': [],
+            'vowel_ratios': [],
+            'word_lengths': [],
+            'remaining_lives': [],
+            'correct_guesses': []
+        }
         logging.debug("ModelHangmanAPI initialized")
     
-    def start_game(self, practice=True, verbose=False):
-        """Start a new game"""
-        self.guessed_letters = []
-        self.remaining_lives = 6
-        result = self.start_game(practice_game=practice)
-        self.word_state = result['word']
-        return result
-    
-    def make_guess(self, letter):
-        """Make a guess and update game state"""
-        result = self.guess(letter)
-        self.word_state = result['word']
-        self.remaining_lives = result['remaining_lives']
-        return result
+    def guess(self, word_state):
+        """Override the guess method to use our model"""
+        try:
+            # Calculate vowel ratio
+            known_vowels = sum(1 for c in word_state[::2] if c in 'aeiou' and c != '_')
+            vowel_ratio = known_vowels / (len(word_state) // 2)
+            word_length = len(word_state) // 2
+            
+            # Prepare state dictionary
+            state = {
+                'current_state': word_state[::2],  # Remove spaces
+                'guessed_letters': sorted(list(self.guessed_letters)),
+                'vowel_ratio': vowel_ratio,
+                'remaining_lives': 6 - len([l for l in self.guessed_letters if l not in word_state])
+            }
+            
+            # Get model prediction
+            with torch.no_grad():
+                char_indices, guessed, vowel_ratio, lives = prepare_input(state)
+                char_indices = char_indices.unsqueeze(0).to(DEVICE)
+                guessed = guessed.unsqueeze(0).to(DEVICE)
+                length = torch.tensor([len(state['current_state'])], dtype=torch.float32).to(DEVICE)
+                vowel_ratio = vowel_ratio.unsqueeze(0).to(DEVICE)
+                lives = lives.unsqueeze(0).to(DEVICE)
+                
+                predictions = self.model(char_indices, guessed, length, vowel_ratio, lives)
+            
+            # Get Q-values for all letters
+            q_values = {chr(i + ord('a')): p.item() for i, p in enumerate(predictions[0])}
+            
+            # Choose next letter (highest Q-value for unguessed letter)
+            valid_preds = [(i, p.item()) for i, p in enumerate(predictions[0])
+                          if chr(i + ord('a')) not in self.guessed_letters]
+            next_letter = chr(max(valid_preds, key=lambda x: x[1])[0] + ord('a'))
+            
+            # Store game state
+            self.game_data['states'].append(word_state)
+            self.game_data['guessed_letters'].append(list(self.guessed_letters))
+            self.game_data['q_values'].append(q_values)
+            self.game_data['chosen_letters'].append(next_letter)
+            self.game_data['vowel_ratios'].append(vowel_ratio)
+            self.game_data['word_lengths'].append(word_length)
+            self.game_data['remaining_lives'].append(state['remaining_lives'])
+            self.game_data['correct_guesses'].append(next_letter in word_state)
+            
+            return next_letter
+            
+        except Exception as e:
+            logging.error(f"Error in model guess: {str(e)}")
+            # Fallback to parent class guess if model fails
+            return super().guess(word_state)
 
 if __name__ == "__main__":
     try:
