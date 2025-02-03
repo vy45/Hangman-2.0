@@ -12,7 +12,8 @@ from pathlib import Path
 from tqdm import tqdm
 from mary_hangman_nv2 import (
     MaryLSTMModel, prepare_input, DEVICE, 
-    prepare_curriculum_batches, prepare_padded_batch, prepare_length_batches
+    prepare_curriculum_batches, prepare_padded_batch, prepare_length_batches,
+    BATCH_SIZE  # Also import BATCH_SIZE constant
 )
 import torch.nn.functional as F
 import os
@@ -224,18 +225,39 @@ def evaluate_validation_states(model, val_states, epoch):
     
     with torch.no_grad():
         for batch in progress_bar:
-            predictions = model(
-                batch['char_indices'],
-                batch['guessed'],
-                batch['lengths'],
-                batch['vowel_ratios'],
-                batch['remaining_lives']
-            )
+            word_states = []
+            guessed_letters = []
+            lengths = []
+            vowel_ratios = []
+            remaining_lives = []
+            targets = []
+            
+            for state in batch:
+                char_indices, guessed, vowel_ratio, lives = prepare_input(state)
+                word_states.append(char_indices)
+                guessed_letters.append(guessed)
+                lengths.append(len(state['current_state']))
+                vowel_ratios.append(vowel_ratio)
+                remaining_lives.append(lives)
+                targets.append(torch.tensor(
+                    list(state['target_distribution'].values()), 
+                    dtype=torch.float32
+                ))
+            
+            # Stack tensors
+            word_states = torch.stack(word_states).to(DEVICE)
+            guessed_letters = torch.stack(guessed_letters).to(DEVICE)
+            lengths = torch.tensor(lengths).to(DEVICE)
+            vowel_ratios = torch.stack(vowel_ratios).to(DEVICE)
+            remaining_lives = torch.stack(remaining_lives).to(DEVICE)
+            targets = torch.stack(targets).to(DEVICE)
+            
+            predictions = model(word_states, guessed_letters, lengths, vowel_ratios, remaining_lives)
             
             # Add small epsilon to prevent log(0)
             epsilon = 1e-7
             predictions = torch.clamp(predictions, epsilon, 1.0 - epsilon)
-            targets = torch.clamp(batch['targets'], epsilon, 1.0 - epsilon)
+            targets = torch.clamp(targets, epsilon, 1.0 - epsilon)
             
             # Normalize predictions and targets
             predictions = F.normalize(predictions, p=1, dim=1)
@@ -263,7 +285,7 @@ def evaluate_validation_states(model, val_states, epoch):
                 pred_data = {
                     'epoch': epoch,
                     'predicted_probs': predictions[i].cpu().numpy(),
-                    'target_probs': batch['targets'][i].cpu().numpy(),
+                    'target_probs': targets[i].cpu().numpy(),
                     'loss': loss.item()
                 }
                 predictions_data.append(pred_data)
@@ -394,92 +416,6 @@ def run_detailed_evaluation(model, val_words, max_words=VALIDATION_WORDS, epoch=
     
     return df
 
-def prepare_length_batches(states, batch_size=64, curriculum_step=None):
-    """Prepare batches with curriculum learning based on missing letters"""
-    # Calculate difficulty for each state (number of missing letters)
-    for state in states:
-        state['difficulty'] = state['current_state'].count('_')
-    
-    # If curriculum_step is provided, filter states by difficulty
-    if curriculum_step is not None:
-        max_missing = curriculum_step + 1  # Start with 1 missing letter
-        states = [s for s in states if s['difficulty'] <= max_missing]
-        logging.info(f"Curriculum step {curriculum_step}: Using states with ≤{max_missing} missing letters")
-        logging.info(f"Number of states in curriculum: {len(states)}")
-    
-    # Sort by length first, then by difficulty
-    sorted_states = sorted(states, key=lambda x: (len(x['current_state']), x['difficulty']))
-    
-    # Pre-process all states at once
-    processed_states = []
-    for state in sorted_states:
-        # Convert word state to indices
-        char_indices = torch.tensor([
-            (ord(c) - ord('a') if c != '_' else 26)
-            for c in state['current_state']
-        ], dtype=torch.long)
-        
-        # Create guessed letters tensor
-        guessed = torch.zeros(26, dtype=torch.long)
-        for letter in state['guessed_letters']:
-            guessed[ord(letter) - ord('a')] = 1
-            
-        # Create target tensor
-        target = torch.zeros(26, dtype=torch.float32)
-        if 'target_distribution' in state:
-            for letter, prob in state['target_distribution'].items():
-                target[ord(letter) - ord('a')] = prob
-                
-        # Store processed tensors
-        processed_states.append({
-            'char_indices': char_indices,
-            'guessed': guessed,
-            'length': len(state['current_state']),
-            'vowel_ratio': state['vowel_ratio'],
-            'remaining_lives': state['remaining_lives'],
-            'target': target
-        })
-    
-    # Create batches
-    batches = []
-    current_batch = []
-    current_length = None
-    
-    for state in processed_states:
-        if current_length is None:
-            current_length = state['length']
-            
-        if state['length'] != current_length or len(current_batch) == batch_size:
-            if current_batch:
-                # Convert batch to tensors and move to device
-                batch_tensors = {
-                    'char_indices': torch.stack([s['char_indices'] for s in current_batch]).to(DEVICE),
-                    'guessed': torch.stack([s['guessed'] for s in current_batch]).to(DEVICE),
-                    'lengths': torch.tensor([s['length'] for s in current_batch], dtype=torch.float32).to(DEVICE),
-                    'vowel_ratios': torch.tensor([s['vowel_ratio'] for s in current_batch], dtype=torch.float32).to(DEVICE),
-                    'remaining_lives': torch.tensor([s['remaining_lives'] for s in current_batch], dtype=torch.float32).to(DEVICE),
-                    'targets': torch.stack([s['target'] for s in current_batch]).to(DEVICE)
-                }
-                batches.append(batch_tensors)
-            current_batch = []
-            current_length = state['length']
-        
-        current_batch.append(state)
-    
-    # Add last batch if exists
-    if current_batch:
-        batch_tensors = {
-            'char_indices': torch.stack([s['char_indices'] for s in current_batch]).to(DEVICE),
-            'guessed': torch.stack([s['guessed'] for s in current_batch]).to(DEVICE),
-            'lengths': torch.tensor([s['length'] for s in current_batch], dtype=torch.float32).to(DEVICE),
-            'vowel_ratios': torch.tensor([s['vowel_ratio'] for s in current_batch], dtype=torch.float32).to(DEVICE),
-            'remaining_lives': torch.tensor([s['remaining_lives'] for s in current_batch], dtype=torch.float32).to(DEVICE),
-            'targets': torch.stack([s['target'] for s in current_batch]).to(DEVICE)
-        }
-        batches.append(batch_tensors)
-    
-    return batches
-
 def train_model():
     logging.info("Starting training process")
     logging.info(f"QUICK_TEST mode: {QUICK_TEST}")
@@ -538,32 +474,27 @@ def train_model():
     # Initial batch preparation
     logging.info("Preparing initial batches...")
     with Timer("Initial Batch Preparation"):
+        # Get batches of states using curriculum with fixed batch size
         all_batches = prepare_curriculum_batches(
             all_states, 
-            max_missing=current_max_missing,
-            epoch=0  # Add epoch parameter
+            epoch=0, 
+            max_missing=current_max_missing
         )
         logging.info(f"Number of batches: {len(all_batches)}")
     
     # Training loop
     for epoch in range(num_epochs):
-        # Update curriculum every epoch until we reach full dataset
         if epoch > 0 and current_max_missing < max_missing_letters:
             current_max_missing += 1
             logging.info(f"Advancing curriculum: max missing letters = {current_max_missing}")
             
             # Prepare new batches for current curriculum
             with Timer("Curriculum Batch Preparation"):
-                if current_max_missing >= max_missing_letters:
-                    # Use all states without curriculum
-                    all_batches = prepare_length_batches(all_states)
-                    logging.info("Using full dataset (curriculum complete)")
-                else:
-                    all_batches = prepare_curriculum_batches(
-                        all_states, 
-                        max_missing=current_max_missing,
-                        epoch=epoch  # Add epoch parameter
-                    )
+                all_batches = prepare_curriculum_batches(
+                    all_states, 
+                    epoch=epoch,
+                    max_missing=current_max_missing if current_max_missing < max_missing_letters else None
+                )
                 logging.info(f"Number of batches: {len(all_batches)}")
         
         with Timer(f"Epoch {epoch + 1}"):
@@ -573,28 +504,32 @@ def train_model():
             
             # Training batches
             progress_bar = tqdm(all_batches, desc=f"Epoch {epoch + 1}/{num_epochs}")
-            for batch_idx, batch in enumerate(progress_bar):
+            for batch_idx, batch_states in enumerate(progress_bar):
                 try:
-                    # Forward pass
-                    optimizer.zero_grad()  # Clear gradients at start
+                    optimizer.zero_grad()
                     
-                    # Store previous weights for rollback if needed
-                    if batch_idx == 0:  # Store once per epoch to save memory
+                    if batch_idx == 0:
                         prev_weights = {name: param.clone().detach() 
                                       for name, param in model.named_parameters()}
                     
+                    # Get padded tensors and move to device in one go
+                    padded_batch = prepare_padded_batch(batch_states)
+                    char_indices, guessed, lengths, vowel_ratios, remaining_lives, targets = [
+                        t.to(DEVICE) for t in padded_batch
+                    ]
+                    
                     predictions = model(
-                        batch['char_indices'],
-                        batch['guessed'],
-                        batch['lengths'],
-                        batch['vowel_ratios'],
-                        batch['remaining_lives']
+                        char_indices,
+                        guessed,
+                        lengths,
+                        vowel_ratios,
+                        remaining_lives
                     )
                     
                     # Add small epsilon to prevent log(0)
                     epsilon = 1e-7
                     predictions = torch.clamp(predictions, epsilon, 1.0 - epsilon)
-                    targets = torch.clamp(batch['targets'], epsilon, 1.0 - epsilon)
+                    targets = torch.clamp(targets, epsilon, 1.0 - epsilon)
                     
                     # Normalize predictions and targets
                     predictions = F.normalize(predictions, p=1, dim=1)

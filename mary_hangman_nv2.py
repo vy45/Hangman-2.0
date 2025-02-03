@@ -595,7 +595,7 @@ def prepare_input(state):
     # Create remaining lives tensor
     lives = torch.tensor(state['remaining_lives'], dtype=torch.float32)
     
-    return char_indices.to(DEVICE), guessed.to(DEVICE), vowel_ratio.to(DEVICE), lives.to(DEVICE)
+    return char_indices, guessed, vowel_ratio, lives
 
 def save_data(train_states, val_states, val_words):
     """Save datasets with timestamp"""
@@ -689,18 +689,18 @@ def prepare_curriculum_batches(train_states, epoch, max_missing=None):
     return batches
 
 def prepare_padded_batch(batch):
-    """Convert batch of states to padded tensors"""
+    """Convert batch of states to padded tensors without moving to device"""
     # Get max length in batch
     max_len = max(len(state['current_state']) for state in batch)
     
-    # Initialize tensors
+    # Initialize tensors (on CPU)
     batch_size = len(batch)
-    word_states = torch.zeros(batch_size, 27, dtype=torch.long).to(DEVICE)  # Changed to long
-    guessed_letters = torch.zeros(batch_size, 26, dtype=torch.long).to(DEVICE)  # Changed to long
-    lengths = torch.zeros(batch_size, dtype=torch.float32).to(DEVICE)
-    vowel_ratios = torch.zeros(batch_size, dtype=torch.float32).to(DEVICE)
-    remaining_lives = torch.zeros(batch_size, dtype=torch.float32).to(DEVICE)
-    targets = torch.zeros(batch_size, 26, dtype=torch.float32).to(DEVICE)
+    word_states = torch.zeros(batch_size, 27, dtype=torch.long)  # Changed to long
+    guessed_letters = torch.zeros(batch_size, 26, dtype=torch.long)  # Changed to long
+    lengths = torch.zeros(batch_size, dtype=torch.float32)
+    vowel_ratios = torch.zeros(batch_size, dtype=torch.float32)
+    remaining_lives = torch.zeros(batch_size, dtype=torch.float32)
+    targets = torch.zeros(batch_size, 26, dtype=torch.float32)
     
     # Fill tensors
     for i, state in enumerate(batch):
@@ -708,7 +708,7 @@ def prepare_padded_batch(batch):
         for j, c in enumerate(state['current_state']):
             if c != '_':
                 word_states[i, ord(c) - ord('a')] = 1
-        word_states[i, -1] = int(state['current_state'].count('_') / len(state['current_state']) * 100)  # Convert ratio to int
+        word_states[i, -1] = int(state['current_state'].count('_') / len(state['current_state']) * 100)
         
         # Guessed letters
         for letter in state['guessed_letters']:
