@@ -17,6 +17,7 @@ from mary_hangman_nv2 import (
 import torch.nn.functional as F
 import os
 import pandas as pd
+import traceback
 
 # Constants
 QUICK_TEST = False  # Set to True to use only 10% of data
@@ -242,6 +243,9 @@ def train_model():
     patience = 5
     patience_counter = 0
     
+    # Add gradient clipping value
+    max_grad_norm = 1.0
+    
     # Training loop
     logging.info("Starting training loop")
     for epoch in range(num_epochs):
@@ -257,23 +261,77 @@ def train_model():
             
             # Training batches
             progress_bar = tqdm(batches, desc=f"Epoch {epoch + 1}/{num_epochs}")
-            for batch in progress_bar:
-                # Prepare padded batch
-                word_states, guessed_letters, lengths, vowel_ratios, remaining_lives, targets = prepare_padded_batch(batch)
-                
-                # Forward pass
-                optimizer.zero_grad()
-                predictions = model(word_states, guessed_letters, lengths, vowel_ratios, remaining_lives)
-                
-                loss = F.kl_div(predictions.log(), targets, reduction='batchmean')
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
-                num_batches += 1
-                
-                # Update progress bar
-                progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+            for batch_idx, batch in enumerate(progress_bar):
+                try:
+                    # Prepare padded batch
+                    word_states, guessed_letters, lengths, vowel_ratios, remaining_lives, targets = prepare_padded_batch(batch)
+                    
+                    # Forward pass
+                    optimizer.zero_grad()
+                    predictions = model(word_states, guessed_letters, lengths, vowel_ratios, remaining_lives)
+                    
+                    loss = F.kl_div(predictions.log(), targets, reduction='batchmean')
+                    
+                    # Check for NaN loss
+                    if torch.isnan(loss):
+                        # Log the state that caused NaN
+                        logging.error(f"NaN loss detected in epoch {epoch+1}, batch {batch_idx}")
+                        logging.error(f"Input shapes:")
+                        logging.error(f"word_states: {word_states.shape}, values: {word_states[:2]}")
+                        logging.error(f"guessed_letters: {guessed_letters.shape}, values: {guessed_letters[:2]}")
+                        logging.error(f"lengths: {lengths.shape}, values: {lengths[:2]}")
+                        logging.error(f"vowel_ratios: {vowel_ratios.shape}, values: {vowel_ratios[:2]}")
+                        logging.error(f"remaining_lives: {remaining_lives.shape}, values: {remaining_lives[:2]}")
+                        logging.error(f"predictions: {predictions[:2]}")
+                        logging.error(f"targets: {targets[:2]}")
+                        
+                        # Save problematic batch for analysis
+                        nan_data = {
+                            'word_states': word_states.cpu().numpy(),
+                            'guessed_letters': guessed_letters.cpu().numpy(),
+                            'lengths': lengths.cpu().numpy(),
+                            'vowel_ratios': vowel_ratios.cpu().numpy(),
+                            'remaining_lives': remaining_lives.cpu().numpy(),
+                            'targets': targets.cpu().numpy(),
+                            'predictions': predictions.detach().cpu().numpy()
+                        }
+                        nan_file = f'nan_batch_e{epoch}_b{batch_idx}.pkl'
+                        with open(nan_file, 'wb') as f:
+                            pickle.dump(nan_data, f)
+                        logging.error(f"Problematic batch saved to {nan_file}")
+                        
+                        raise ValueError("NaN loss detected - training stopped")
+                    
+                    # Backward pass
+                    loss.backward()
+                    
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    
+                    # Check for NaN gradients
+                    for name, param in model.named_parameters():
+                        if param.grad is not None and torch.isnan(param.grad).any():
+                            logging.error(f"NaN gradient detected in {name}")
+                            raise ValueError(f"NaN gradient detected in {name} - training stopped")
+                    
+                    optimizer.step()
+                    
+                    # Check for NaN parameters
+                    for name, param in model.named_parameters():
+                        if torch.isnan(param).any():
+                            logging.error(f"NaN parameter detected in {name}")
+                            raise ValueError(f"NaN parameter detected in {name} - training stopped")
+                    
+                    total_loss += loss.item()
+                    num_batches += 1
+                    
+                    # Update progress bar
+                    progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+                    
+                except Exception as e:
+                    logging.error(f"Error in batch {batch_idx}: {str(e)}")
+                    logging.error(traceback.format_exc())
+                    raise  # Re-raise the exception to stop training
             
             avg_loss = total_loss/num_batches
             logging.info(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
