@@ -212,7 +212,6 @@ def evaluate_validation_states(model, val_states, epoch):
     num_batches = 0
     predictions_data = []
     nan_val_batches = 0
-    max_nan_val_batches = 5  # Maximum allowed NaN validation batches
     
     # Prepare validation batches
     with Timer("Validation Batch Preparation"):
@@ -224,67 +223,60 @@ def evaluate_validation_states(model, val_states, epoch):
     
     with torch.no_grad():
         for batch in progress_bar:
-            try:
-                predictions = model(
-                    batch['char_indices'],
-                    batch['guessed'],
-                    batch['lengths'],
-                    batch['vowel_ratios'],
-                    batch['remaining_lives']
-                )
-                
-                # Add small epsilon to prevent log(0)
-                epsilon = 1e-7
-                predictions = torch.clamp(predictions, epsilon, 1.0 - epsilon)
-                targets = torch.clamp(batch['targets'], epsilon, 1.0 - epsilon)
-                
-                # Normalize predictions and targets
-                predictions = F.normalize(predictions, p=1, dim=1)
-                targets = F.normalize(targets, p=1, dim=1)
-                
-                loss = F.kl_div(predictions.log(), targets, reduction='batchmean')
-                
-                # Check for NaN loss
-                if torch.isnan(loss):
-                    nan_val_batches += 1
-                    logging.warning(f"NaN validation loss in batch, skipping")
-                    if nan_val_batches >= max_nan_val_batches:
-                        logging.error("Too many NaN validation losses")
-                        return float('inf')  # Signal problem to training loop
-                    continue
-                
-                total_loss += loss.item()
-                num_batches += 1
-                
-                # Update progress bar
-                progress_bar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'nan_batches': nan_val_batches
-                })
-                
-                # Store predictions for analysis
-                for i in range(len(predictions)):
-                    pred_data = {
-                        'epoch': epoch,
-                        'predicted_probs': predictions[i].cpu().numpy(),
-                        'target_probs': batch['targets'][i].cpu().numpy(),
-                        'loss': loss.item()
-                    }
-                    predictions_data.append(pred_data)
-                    
-            except Exception as e:
-                logging.error(f"Error in validation batch: {str(e)}")
+            predictions = model(
+                batch['char_indices'],
+                batch['guessed'],
+                batch['lengths'],
+                batch['vowel_ratios'],
+                batch['remaining_lives']
+            )
+            
+            # Add small epsilon to prevent log(0)
+            epsilon = 1e-7
+            predictions = torch.clamp(predictions, epsilon, 1.0 - epsilon)
+            targets = torch.clamp(batch['targets'], epsilon, 1.0 - epsilon)
+            
+            # Normalize predictions and targets
+            predictions = F.normalize(predictions, p=1, dim=1)
+            targets = F.normalize(targets, p=1, dim=1)
+            
+            loss = F.kl_div(predictions.log(), targets, reduction='batchmean')
+            
+            # Check for NaN loss
+            if torch.isnan(loss):
+                nan_val_batches += 1
+                logging.warning(f"NaN validation loss in batch {num_batches}")
                 continue
+                
+            total_loss += loss.item()
+            num_batches += 1
+            
+            # Update progress bar
+            progress_bar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'nan_batches': nan_val_batches
+            })
+            
+            # Store predictions for analysis
+            for i in range(len(predictions)):
+                pred_data = {
+                    'epoch': epoch,
+                    'predicted_probs': predictions[i].cpu().numpy(),
+                    'target_probs': batch['targets'][i].cpu().numpy(),
+                    'loss': loss.item()
+                }
+                predictions_data.append(pred_data)
     
+    # Handle case where all batches had NaN loss
     if num_batches == 0:
-        logging.error("No valid validation batches")
+        logging.error("All validation batches resulted in NaN loss")
         return float('inf')
         
     avg_val_loss = total_loss / num_batches
     logging.info(f"Validation Loss: {avg_val_loss:.4f} (skipped {nan_val_batches} NaN batches)")
     
-    # Save predictions to CSV
-    if predictions_data:  # Only save if we have valid predictions
+    # Save predictions to CSV if we have valid predictions
+    if predictions_data:
         df = pd.DataFrame(predictions_data)
         csv_dir = os.path.join(os.getcwd(), 'val_predictions')
         os.makedirs(csv_dir, exist_ok=True)
@@ -401,10 +393,21 @@ def run_detailed_evaluation(model, val_words, max_words=VALIDATION_WORDS, epoch=
     
     return df
 
-def prepare_length_batches(states, batch_size=64):
-    """Prepare batches once and keep them on device"""
-    # Sort by length first
-    sorted_states = sorted(states, key=lambda x: len(x['current_state']))
+def prepare_length_batches(states, batch_size=64, curriculum_step=None):
+    """Prepare batches with curriculum learning based on missing letters"""
+    # Calculate difficulty for each state (number of missing letters)
+    for state in states:
+        state['difficulty'] = state['current_state'].count('_')
+    
+    # If curriculum_step is provided, filter states by difficulty
+    if curriculum_step is not None:
+        max_missing = curriculum_step + 1  # Start with 1 missing letter
+        states = [s for s in states if s['difficulty'] <= max_missing]
+        logging.info(f"Curriculum step {curriculum_step}: Using states with ≤{max_missing} missing letters")
+        logging.info(f"Number of states in curriculum: {len(states)}")
+    
+    # Sort by length first, then by difficulty
+    sorted_states = sorted(states, key=lambda x: (len(x['current_state']), x['difficulty']))
     
     # Pre-process all states at once
     processed_states = []
@@ -497,7 +500,7 @@ def train_model():
     
     # Combine train and validation sets
     with Timer("Dataset Preparation"):
-        all_states = data['train_states'] #+ data['val_states']
+        all_states = data['train_states'] + data['val_states']
         if QUICK_TEST:
             # Use only 10% of data for quick testing
             all_states = all_states[:len(all_states)//10]
@@ -521,25 +524,39 @@ def train_model():
     
     # Add counters for monitoring
     nan_loss_count = 0
-    max_nan_losses = 100  # Maximum number of NaN losses before stopping
+    max_nan_losses = 10  # Maximum number of NaN losses before stopping
     
-    # Prepare batches once before training
-    logging.info("Preparing batches...")
-    with Timer("Batch Preparation"):
-        all_batches = prepare_length_batches(all_states)
-        logging.info(f"Number of batches: {len(all_batches)}")
+    # Add counter for consecutive NaN validation losses
+    consecutive_nan_val = 0
+    max_consecutive_nan_val = 3  # Maximum allowed consecutive NaN validation losses
     
-    # Add learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
+    # Curriculum learning parameters
+    curriculum_epochs = 5  # Number of epochs per difficulty level
+    max_difficulty = max(state['current_state'].count('_') for state in all_states)
+    curriculum_steps = range(max_difficulty)
     
-    # Training loop
-    logging.info("Starting training loop")
+    # Training loop with curriculum
+    logging.info("Starting training loop with curriculum learning")
+    current_curriculum = 0
+    
     for epoch in range(num_epochs):
+        # Update curriculum step every curriculum_epochs
+        if epoch > 0 and epoch % curriculum_epochs == 0:
+            current_curriculum = min(current_curriculum + 1, max_difficulty - 1)
+            logging.info(f"Advancing curriculum to step {current_curriculum}")
+            
+            # Prepare new batches for current curriculum
+            with Timer("Curriculum Batch Preparation"):
+                all_batches = prepare_length_batches(
+                    all_states, 
+                    curriculum_step=current_curriculum
+                )
+                logging.info(f"Number of batches in curriculum: {len(all_batches)}")
+        
         with Timer(f"Epoch {epoch + 1}"):
             model.train()
             total_loss = 0
             num_batches = 0
-            nan_loss_this_epoch = 0
             
             # Training batches
             progress_bar = tqdm(all_batches, desc=f"Epoch {epoch + 1}/{num_epochs}")
@@ -576,12 +593,11 @@ def train_model():
                     # Check for NaN loss
                     if torch.isnan(loss):
                         nan_loss_count += 1
-                        nan_loss_this_epoch += 1
                         logging.warning(f"NaN loss detected in epoch {epoch+1}, batch {batch_idx}")
-                        logging.warning(f"Total NaN losses: {nan_loss_count}, This epoch: {nan_loss_this_epoch}")
+                        logging.warning(f"Total NaN losses: {nan_loss_count}")
                         
                         # Rollback to previous weights if needed
-                        if nan_loss_this_epoch > 5:  # Too many NaNs in this epoch
+                        if nan_loss_count > 5:  # Too many NaNs
                             logging.warning("Rolling back to start of epoch weights")
                             with torch.no_grad():
                                 for name, param in model.named_parameters():
@@ -617,7 +633,6 @@ def train_model():
                     num_batches += 1
                     progress_bar.set_postfix({
                         'loss': f'{loss.item():.4f}',
-                        'nan_loss': nan_loss_this_epoch
                     })
                     
                 except Exception as e:
@@ -647,21 +662,30 @@ def train_model():
                 ])
                 completion_rate = successful_words / len(detailed_stats['word'].unique())
                 logging.info(f"Epoch {epoch+1} - Completion Rate: {completion_rate:.4f}")
-            # Update learning rate
-            scheduler.step(val_loss)
             
-            # Early stopping check
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                model_path = f'best_model_nv2_enhanced_loss{val_loss:.3f}.pth'
-                torch.save(model.state_dict(), model_path)
-                logging.info(f"New best model saved: {model_path}")
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    logging.info("Early stopping triggered")
+            # Handle NaN validation loss
+            if val_loss == float('inf') or torch.isnan(torch.tensor(val_loss)):
+                consecutive_nan_val += 1
+                logging.warning(f"NaN validation loss detected ({consecutive_nan_val}/{max_consecutive_nan_val})")
+                if consecutive_nan_val >= max_consecutive_nan_val:
+                    logging.error("Too many consecutive NaN validation losses - stopping training")
                     break
+                continue  # Skip to next epoch
+            else:
+                consecutive_nan_val = 0  # Reset counter on valid loss
+                
+                # Early stopping check
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    model_path = f'best_model_nv2_enhanced_loss{val_loss:.3f}.pth'
+                    torch.save(model.state_dict(), model_path)
+                    logging.info(f"New best model saved: {model_path}")
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        logging.info("Early stopping triggered")
+                        break
 
 class ModelHangmanAPI(HangmanAPI):
     """Extended HangmanAPI that uses ML model for guessing"""
