@@ -485,11 +485,18 @@ def train_model():
     # Add gradient clipping value
     max_grad_norm = 1.0
     
+    # Add counters for monitoring
+    nan_loss_count = 0
+    max_nan_losses = 100  # Maximum number of NaN losses before stopping
+    
     # Prepare batches once before training
     logging.info("Preparing batches...")
     with Timer("Batch Preparation"):
         all_batches = prepare_length_batches(all_states)
         logging.info(f"Number of batches: {len(all_batches)}")
+    
+    # Add learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
     
     # Training loop
     logging.info("Starting training loop")
@@ -498,13 +505,20 @@ def train_model():
             model.train()
             total_loss = 0
             num_batches = 0
+            nan_loss_this_epoch = 0
             
             # Training batches
             progress_bar = tqdm(all_batches, desc=f"Epoch {epoch + 1}/{num_epochs}")
             for batch_idx, batch in enumerate(progress_bar):
                 try:
                     # Forward pass
-                    optimizer.zero_grad()
+                    optimizer.zero_grad()  # Clear gradients at start
+                    
+                    # Store previous weights for rollback if needed
+                    if batch_idx == 0:  # Store once per epoch to save memory
+                        prev_weights = {name: param.clone().detach() 
+                                      for name, param in model.named_parameters()}
+                    
                     predictions = model(
                         batch['char_indices'],
                         batch['guessed'],
@@ -513,73 +527,78 @@ def train_model():
                         batch['remaining_lives']
                     )
                     
-                    loss = F.kl_div(predictions.log(), batch['targets'], reduction='batchmean')
+                    # Add small epsilon to prevent log(0)
+                    epsilon = 1e-7
+                    predictions = torch.clamp(predictions, epsilon, 1.0 - epsilon)
+                    targets = torch.clamp(batch['targets'], epsilon, 1.0 - epsilon)
+                    
+                    # Normalize predictions and targets
+                    predictions = F.normalize(predictions, p=1, dim=1)
+                    targets = F.normalize(targets, p=1, dim=1)
+                    
+                    # Calculate KL divergence loss
+                    loss = F.kl_div(predictions.log(), targets, reduction='batchmean')
                     
                     # Check for NaN loss
                     if torch.isnan(loss):
-                        # Log the state that caused NaN
-                        logging.error(f"NaN loss detected in epoch {epoch+1}, batch {batch_idx}")
-                        logging.error(f"Input shapes:")
-                        logging.error(f"char_indices: {batch['char_indices'].shape}, values: {batch['char_indices'][:2]}")
-                        logging.error(f"guessed: {batch['guessed'].shape}, values: {batch['guessed'][:2]}")
-                        logging.error(f"lengths: {batch['lengths'].shape}, values: {batch['lengths'][:2]}")
-                        logging.error(f"vowel_ratios: {batch['vowel_ratios'].shape}, values: {batch['vowel_ratios'][:2]}")
-                        logging.error(f"remaining_lives: {batch['remaining_lives'].shape}, values: {batch['remaining_lives'][:2]}")
-                        logging.error(f"predictions: {predictions[:2]}")
-                        logging.error(f"targets: {batch['targets'][:2]}")
+                        nan_loss_count += 1
+                        nan_loss_this_epoch += 1
+                        logging.warning(f"NaN loss detected in epoch {epoch+1}, batch {batch_idx}")
+                        logging.warning(f"Total NaN losses: {nan_loss_count}, This epoch: {nan_loss_this_epoch}")
                         
-                        # Save problematic batch for analysis
-                        nan_data = {
-                            'char_indices': batch['char_indices'].cpu().numpy(),
-                            'guessed': batch['guessed'].cpu().numpy(),
-                            'lengths': batch['lengths'].cpu().numpy(),
-                            'vowel_ratios': batch['vowel_ratios'].cpu().numpy(),
-                            'remaining_lives': batch['remaining_lives'].cpu().numpy(),
-                            'targets': batch['targets'].cpu().numpy(),
-                            'predictions': predictions.detach().cpu().numpy()
-                        }
-                        nan_file = f'nan_batch_e{epoch}_b{batch_idx}.pkl'
-                        with open(nan_file, 'wb') as f:
-                            pickle.dump(nan_data, f)
-                        logging.error(f"Problematic batch saved to {nan_file}")
-                        
-                        raise ValueError("NaN loss detected - training stopped")
+                        # Rollback to previous weights if needed
+                        if nan_loss_this_epoch > 5:  # Too many NaNs in this epoch
+                            logging.warning("Rolling back to start of epoch weights")
+                            with torch.no_grad():
+                                for name, param in model.named_parameters():
+                                    param.copy_(prev_weights[name])
+                            break  # Exit batch loop, try next epoch
+                            
+                        if nan_loss_count >= max_nan_losses:
+                            logging.error(f"Too many NaN losses ({nan_loss_count}), stopping training")
+                            return  # Exit training
+                            
+                        continue  # Skip this batch
                     
-                    # Backward pass
+                    # Backward pass with gradient clipping
                     loss.backward()
-                    
-                    # Gradient clipping
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                     
                     # Check for NaN gradients
+                    has_nan_grad = False
                     for name, param in model.named_parameters():
                         if param.grad is not None and torch.isnan(param.grad).any():
-                            logging.error(f"NaN gradient detected in {name}")
-                            raise ValueError(f"NaN gradient detected in {name} - training stopped")
+                            has_nan_grad = True
+                            logging.warning(f"NaN gradient detected in {name}")
+                            break
+                    
+                    if has_nan_grad:
+                        optimizer.zero_grad()  # Clear bad gradients
+                        continue  # Skip this batch
                     
                     optimizer.step()
                     
-                    # Check for NaN parameters
-                    for name, param in model.named_parameters():
-                        if torch.isnan(param).any():
-                            logging.error(f"NaN parameter detected in {name}")
-                            raise ValueError(f"NaN parameter detected in {name} - training stopped")
-                    
+                    # Update metrics
                     total_loss += loss.item()
                     num_batches += 1
-                    
-                    # Update progress bar
-                    progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+                    progress_bar.set_postfix({
+                        'loss': f'{loss.item():.4f}',
+                        'nan_loss': nan_loss_this_epoch
+                    })
                     
                 except Exception as e:
                     logging.error(f"Error in batch {batch_idx}: {str(e)}")
                     logging.error(traceback.format_exc())
-                    raise  # Re-raise the exception to stop training
+                    continue
             
+            if num_batches == 0:
+                logging.error("No valid batches in epoch")
+                break
+                
             avg_loss = total_loss/num_batches
             logging.info(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
             
-            # Calculate validation loss
+            # Validation and model saving
             val_loss = evaluate_validation_states(model, data['val_states'][:VALIDATION_STATES], epoch)
             logging.info(f"Epoch {epoch+1} - Validation Loss: {val_loss:.4f}")
             
@@ -594,8 +613,10 @@ def train_model():
                 ])
                 completion_rate = successful_words / len(detailed_stats['word'].unique())
                 logging.info(f"Epoch {epoch+1} - Completion Rate: {completion_rate:.4f}")
+            # Update learning rate
+            scheduler.step(val_loss)
             
-            # Early stopping based on validation loss
+            # Early stopping check
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 model_path = f'best_model_nv2_enhanced_loss{val_loss:.3f}.pth'
