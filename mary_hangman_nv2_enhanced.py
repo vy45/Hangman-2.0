@@ -34,7 +34,7 @@ logging.info(f"Using device: {DEVICE}")
 # Constants
 QUICK_TEST = True  # Set to True to use only 10% of data
 DATA_DIR = 'hangman_data'
-
+VALIDATION_WORDS = 10000
 
 # Modify logging setup
 def setup_logging():
@@ -135,16 +135,18 @@ def evaluate_model_with_api(model, num_practice_games=100, epoch=0):
     logging.info(f"Evaluation complete. Final win rate: {final_rate:.2%}")
     return final_rate
 
-def run_detailed_evaluation(model, val_words, max_words=1000, epoch=0):
+def run_detailed_evaluation(model, val_words, max_words=VALIDATION_WORDS, epoch=0):
     """Run detailed evaluation on validation words with comprehensive logging"""
     logging.info("\nStarting Detailed Evaluation")
     
     eval_data = []
+    num_words = min(len(val_words), max_words)
     
-    for word_idx, word in enumerate(val_words):
-        if word_idx >= max_words:
-            break
-            
+    # Create progress bar for words
+    progress_bar = tqdm(range(num_words), desc="Evaluating words")
+    
+    for word_idx in progress_bar:
+        word = val_words[word_idx]
         current_state = '_' * len(word)
         guessed_letters = set()
         wrong_guesses = 0
@@ -197,6 +199,13 @@ def run_detailed_evaluation(model, val_words, max_words=1000, epoch=0):
                 'is_correct': next_letter in word_letters
             }
             eval_data.append(turn_data)
+            
+            # Update progress bar with current word state
+            progress_bar.set_postfix({
+                'word': word, 
+                'state': current_state, 
+                'lives': 6 - wrong_guesses
+            })
             
             # Update game state
             guessed_letters.add(next_letter)
@@ -438,7 +447,7 @@ def train_model():
             # if (epoch + 1) % 2 == 0:
             #     detailed_stats = run_detailed_evaluation(model, data['val_words'][:100], epoch=epoch)
             #     logging.info(f"Epoch {epoch+1} - Detailed Evaluation Stats: {detailed_stats}")
-            detailed_stats = run_detailed_evaluation(model, data['val_words'][:100], epoch=epoch)
+            detailed_stats = run_detailed_evaluation(model, data['val_words'], epoch=epoch)
             
             # Calculate completion rate from detailed evaluation
             successful_words = len([
