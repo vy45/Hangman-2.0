@@ -463,7 +463,7 @@ def train_model():
     
     # Combine train and validation sets
     with Timer("Dataset Preparation"):
-        all_states = data['train_states'] + data['val_states']
+        all_states = data['train_states'] #+ data['val_states']
         if QUICK_TEST:
             # Use only 10% of data for quick testing
             all_states = all_states[:len(all_states)//10]
