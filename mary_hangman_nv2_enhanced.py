@@ -532,13 +532,17 @@ def train_model():
     max_consecutive_nan_val = 3  # Maximum allowed consecutive NaN validation losses
     
     # Curriculum learning parameters
-    max_missing_letters = 6#max(state['current_state'].count('_') for state in all_states)
+    max_missing_letters = 6  # max number of missing letters
     current_max_missing = 1  # Start with 1 missing letter
     
     # Initial batch preparation
     logging.info("Preparing initial batches...")
     with Timer("Initial Batch Preparation"):
-        all_batches = prepare_curriculum_batches(all_states, max_missing=current_max_missing)
+        all_batches = prepare_curriculum_batches(
+            all_states, 
+            max_missing=current_max_missing,
+            epoch=0  # Add epoch parameter
+        )
         logging.info(f"Number of batches: {len(all_batches)}")
     
     # Training loop
@@ -557,7 +561,8 @@ def train_model():
                 else:
                     all_batches = prepare_curriculum_batches(
                         all_states, 
-                        max_missing=current_max_missing
+                        max_missing=current_max_missing,
+                        epoch=epoch  # Add epoch parameter
                     )
                 logging.info(f"Number of batches: {len(all_batches)}")
         
