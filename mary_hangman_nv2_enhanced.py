@@ -211,6 +211,8 @@ def evaluate_validation_states(model, val_states, epoch):
     total_loss = 0
     num_batches = 0
     predictions_data = []
+    nan_val_batches = 0
+    max_nan_val_batches = 5  # Maximum allowed NaN validation batches
     
     # Prepare validation batches
     with Timer("Validation Batch Preparation"):
@@ -222,41 +224,73 @@ def evaluate_validation_states(model, val_states, epoch):
     
     with torch.no_grad():
         for batch in progress_bar:
-            predictions = model(
-                batch['char_indices'],
-                batch['guessed'],
-                batch['lengths'],
-                batch['vowel_ratios'],
-                batch['remaining_lives']
-            )
-            
-            loss = F.kl_div(predictions.log(), batch['targets'], reduction='batchmean')
-            total_loss += loss.item()
-            num_batches += 1
-            
-            # Update progress bar
-            progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
-            
-            # Store predictions for analysis
-            for i in range(len(predictions)):
-                pred_data = {
-                    'epoch': epoch,
-                    'predicted_probs': predictions[i].cpu().numpy(),
-                    'target_probs': batch['targets'][i].cpu().numpy(),
-                    'loss': loss.item()
-                }
-                predictions_data.append(pred_data)
+            try:
+                predictions = model(
+                    batch['char_indices'],
+                    batch['guessed'],
+                    batch['lengths'],
+                    batch['vowel_ratios'],
+                    batch['remaining_lives']
+                )
+                
+                # Add small epsilon to prevent log(0)
+                epsilon = 1e-7
+                predictions = torch.clamp(predictions, epsilon, 1.0 - epsilon)
+                targets = torch.clamp(batch['targets'], epsilon, 1.0 - epsilon)
+                
+                # Normalize predictions and targets
+                predictions = F.normalize(predictions, p=1, dim=1)
+                targets = F.normalize(targets, p=1, dim=1)
+                
+                loss = F.kl_div(predictions.log(), targets, reduction='batchmean')
+                
+                # Check for NaN loss
+                if torch.isnan(loss):
+                    nan_val_batches += 1
+                    logging.warning(f"NaN validation loss in batch, skipping")
+                    if nan_val_batches >= max_nan_val_batches:
+                        logging.error("Too many NaN validation losses")
+                        return float('inf')  # Signal problem to training loop
+                    continue
+                
+                total_loss += loss.item()
+                num_batches += 1
+                
+                # Update progress bar
+                progress_bar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'nan_batches': nan_val_batches
+                })
+                
+                # Store predictions for analysis
+                for i in range(len(predictions)):
+                    pred_data = {
+                        'epoch': epoch,
+                        'predicted_probs': predictions[i].cpu().numpy(),
+                        'target_probs': batch['targets'][i].cpu().numpy(),
+                        'loss': loss.item()
+                    }
+                    predictions_data.append(pred_data)
+                    
+            except Exception as e:
+                logging.error(f"Error in validation batch: {str(e)}")
+                continue
     
-    avg_val_loss = total_loss / num_batches if num_batches > 0 else float('inf')
-    logging.info(f"Validation Loss: {avg_val_loss:.4f}")
+    if num_batches == 0:
+        logging.error("No valid validation batches")
+        return float('inf')
+        
+    avg_val_loss = total_loss / num_batches
+    logging.info(f"Validation Loss: {avg_val_loss:.4f} (skipped {nan_val_batches} NaN batches)")
     
     # Save predictions to CSV
-    df = pd.DataFrame(predictions_data)
-    csv_dir = os.path.join(os.getcwd(), 'val_predictions')
-    os.makedirs(csv_dir, exist_ok=True)
-    csv_path = os.path.join(csv_dir, f'val_predictions_epoch_{epoch}.csv')
-    df.to_csv(csv_path, index=False)
-    logging.info(f"Validation predictions saved to {csv_path}")
+    if predictions_data:  # Only save if we have valid predictions
+        df = pd.DataFrame(predictions_data)
+        csv_dir = os.path.join(os.getcwd(), 'val_predictions')
+        os.makedirs(csv_dir, exist_ok=True)
+        csv_path = os.path.join(csv_dir, f'val_predictions_epoch_{epoch}.csv')
+        df.to_csv(csv_path, index=False)
+        logging.info(f"Validation predictions saved to {csv_path}")
     
     return avg_val_loss
 
