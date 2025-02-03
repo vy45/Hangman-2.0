@@ -18,9 +18,21 @@ import torch.nn.functional as F
 import os
 import pandas as pd
 import traceback
+import platform
+
+# Setup device
+def setup_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available() and platform.processor() == 'arm':
+        return torch.device("mps")
+    return torch.device("cpu")
+
+DEVICE = setup_device()
+logging.info(f"Using device: {DEVICE}")
 
 # Constants
-QUICK_TEST = False  # Set to True to use only 10% of data
+QUICK_TEST = True  # Set to True to use only 10% of data
 DATA_DIR = 'hangman_data'
 
 
@@ -123,7 +135,7 @@ def evaluate_model_with_api(model, num_practice_games=100, epoch=0):
     logging.info(f"Evaluation complete. Final win rate: {final_rate:.2%}")
     return final_rate
 
-def run_detailed_evaluation(model, val_words, max_words=5, epoch=0):
+def run_detailed_evaluation(model, val_words, max_words=1000, epoch=0):
     """Run detailed evaluation on validation words with comprehensive logging"""
     logging.info("\nStarting Detailed Evaluation")
     
@@ -203,6 +215,81 @@ def run_detailed_evaluation(model, val_words, max_words=5, epoch=0):
     
     return df
 
+def prepare_length_batches(states, batch_size=64):
+    """Prepare batches once and keep them on device"""
+    # Sort by length first
+    sorted_states = sorted(states, key=lambda x: len(x['current_state']))
+    
+    # Pre-process all states at once
+    processed_states = []
+    for state in sorted_states:
+        # Convert word state to indices
+        char_indices = torch.tensor([
+            (ord(c) - ord('a') if c != '_' else 26)
+            for c in state['current_state']
+        ], dtype=torch.long)
+        
+        # Create guessed letters tensor
+        guessed = torch.zeros(26, dtype=torch.long)
+        for letter in state['guessed_letters']:
+            guessed[ord(letter) - ord('a')] = 1
+            
+        # Create target tensor
+        target = torch.zeros(26, dtype=torch.float32)
+        if 'target_distribution' in state:
+            for letter, prob in state['target_distribution'].items():
+                target[ord(letter) - ord('a')] = prob
+                
+        # Store processed tensors
+        processed_states.append({
+            'char_indices': char_indices,
+            'guessed': guessed,
+            'length': len(state['current_state']),
+            'vowel_ratio': state['vowel_ratio'],
+            'remaining_lives': state['remaining_lives'],
+            'target': target
+        })
+    
+    # Create batches
+    batches = []
+    current_batch = []
+    current_length = None
+    
+    for state in processed_states:
+        if current_length is None:
+            current_length = state['length']
+            
+        if state['length'] != current_length or len(current_batch) == batch_size:
+            if current_batch:
+                # Convert batch to tensors and move to device
+                batch_tensors = {
+                    'char_indices': torch.stack([s['char_indices'] for s in current_batch]).to(DEVICE),
+                    'guessed': torch.stack([s['guessed'] for s in current_batch]).to(DEVICE),
+                    'lengths': torch.tensor([s['length'] for s in current_batch], dtype=torch.float32).to(DEVICE),
+                    'vowel_ratios': torch.tensor([s['vowel_ratio'] for s in current_batch], dtype=torch.float32).to(DEVICE),
+                    'remaining_lives': torch.tensor([s['remaining_lives'] for s in current_batch], dtype=torch.float32).to(DEVICE),
+                    'targets': torch.stack([s['target'] for s in current_batch]).to(DEVICE)
+                }
+                batches.append(batch_tensors)
+            current_batch = []
+            current_length = state['length']
+        
+        current_batch.append(state)
+    
+    # Add last batch if exists
+    if current_batch:
+        batch_tensors = {
+            'char_indices': torch.stack([s['char_indices'] for s in current_batch]).to(DEVICE),
+            'guessed': torch.stack([s['guessed'] for s in current_batch]).to(DEVICE),
+            'lengths': torch.tensor([s['length'] for s in current_batch], dtype=torch.float32).to(DEVICE),
+            'vowel_ratios': torch.tensor([s['vowel_ratio'] for s in current_batch], dtype=torch.float32).to(DEVICE),
+            'remaining_lives': torch.tensor([s['remaining_lives'] for s in current_batch], dtype=torch.float32).to(DEVICE),
+            'targets': torch.stack([s['target'] for s in current_batch]).to(DEVICE)
+        }
+        batches.append(batch_tensors)
+    
+    return batches
+
 def train_model():
     logging.info("Starting training process")
     logging.info(f"QUICK_TEST mode: {QUICK_TEST}")
@@ -246,6 +333,12 @@ def train_model():
     # Add gradient clipping value
     max_grad_norm = 1.0
     
+    # Prepare batches once before training
+    logging.info("Preparing batches...")
+    with Timer("Batch Preparation"):
+        all_batches = prepare_length_batches(all_states)
+        logging.info(f"Number of batches: {len(all_batches)}")
+    
     # Training loop
     logging.info("Starting training loop")
     for epoch in range(num_epochs):
@@ -254,45 +347,43 @@ def train_model():
             total_loss = 0
             num_batches = 0
             
-            # Prepare batches for this epoch
-            with Timer("Batch Preparation"):
-                batches = prepare_length_batches(all_states)
-                logging.info(f"Number of batches: {len(batches)}")
-            
             # Training batches
-            progress_bar = tqdm(batches, desc=f"Epoch {epoch + 1}/{num_epochs}")
+            progress_bar = tqdm(all_batches, desc=f"Epoch {epoch + 1}/{num_epochs}")
             for batch_idx, batch in enumerate(progress_bar):
                 try:
-                    # Prepare padded batch
-                    word_states, guessed_letters, lengths, vowel_ratios, remaining_lives, targets = prepare_padded_batch(batch)
-                    
                     # Forward pass
                     optimizer.zero_grad()
-                    predictions = model(word_states, guessed_letters, lengths, vowel_ratios, remaining_lives)
+                    predictions = model(
+                        batch['char_indices'],
+                        batch['guessed'],
+                        batch['lengths'],
+                        batch['vowel_ratios'],
+                        batch['remaining_lives']
+                    )
                     
-                    loss = F.kl_div(predictions.log(), targets, reduction='batchmean')
+                    loss = F.kl_div(predictions.log(), batch['targets'], reduction='batchmean')
                     
                     # Check for NaN loss
                     if torch.isnan(loss):
                         # Log the state that caused NaN
                         logging.error(f"NaN loss detected in epoch {epoch+1}, batch {batch_idx}")
                         logging.error(f"Input shapes:")
-                        logging.error(f"word_states: {word_states.shape}, values: {word_states[:2]}")
-                        logging.error(f"guessed_letters: {guessed_letters.shape}, values: {guessed_letters[:2]}")
-                        logging.error(f"lengths: {lengths.shape}, values: {lengths[:2]}")
-                        logging.error(f"vowel_ratios: {vowel_ratios.shape}, values: {vowel_ratios[:2]}")
-                        logging.error(f"remaining_lives: {remaining_lives.shape}, values: {remaining_lives[:2]}")
+                        logging.error(f"char_indices: {batch['char_indices'].shape}, values: {batch['char_indices'][:2]}")
+                        logging.error(f"guessed: {batch['guessed'].shape}, values: {batch['guessed'][:2]}")
+                        logging.error(f"lengths: {batch['lengths'].shape}, values: {batch['lengths'][:2]}")
+                        logging.error(f"vowel_ratios: {batch['vowel_ratios'].shape}, values: {batch['vowel_ratios'][:2]}")
+                        logging.error(f"remaining_lives: {batch['remaining_lives'].shape}, values: {batch['remaining_lives'][:2]}")
                         logging.error(f"predictions: {predictions[:2]}")
-                        logging.error(f"targets: {targets[:2]}")
+                        logging.error(f"targets: {batch['targets'][:2]}")
                         
                         # Save problematic batch for analysis
                         nan_data = {
-                            'word_states': word_states.cpu().numpy(),
-                            'guessed_letters': guessed_letters.cpu().numpy(),
-                            'lengths': lengths.cpu().numpy(),
-                            'vowel_ratios': vowel_ratios.cpu().numpy(),
-                            'remaining_lives': remaining_lives.cpu().numpy(),
-                            'targets': targets.cpu().numpy(),
+                            'char_indices': batch['char_indices'].cpu().numpy(),
+                            'guessed': batch['guessed'].cpu().numpy(),
+                            'lengths': batch['lengths'].cpu().numpy(),
+                            'vowel_ratios': batch['vowel_ratios'].cpu().numpy(),
+                            'remaining_lives': batch['remaining_lives'].cpu().numpy(),
+                            'targets': batch['targets'].cpu().numpy(),
                             'predictions': predictions.detach().cpu().numpy()
                         }
                         nan_file = f'nan_batch_e{epoch}_b{batch_idx}.pkl'
@@ -336,15 +427,30 @@ def train_model():
             avg_loss = total_loss/num_batches
             logging.info(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
             
-            # Evaluate using HangmanAPI
+            # Evaluate on validation words
             model.eval()
-            completion_rate = evaluate_model_with_api(model, epoch=epoch)
-            logging.info(f"Epoch {epoch+1} - Completion Rate: {completion_rate:.4f}")
             
-            # Run detailed evaluation every 2 epochs
-            if (epoch + 1) % 2 == 0:
-                detailed_stats = run_detailed_evaluation(model, data['val_words'][:100], epoch=epoch)
-                logging.info(f"Epoch {epoch+1} - Detailed Evaluation Stats: {detailed_stats}")
+            # Evaluate using HangmanAPI
+            # completion_rate = evaluate_model_with_api(model, epoch=epoch)
+            # logging.info(f"Epoch {epoch+1} - Completion Rate: {completion_rate:.4f}")
+            
+            # # Run detailed evaluation every 2 epochs
+            # if (epoch + 1) % 2 == 0:
+            #     detailed_stats = run_detailed_evaluation(model, data['val_words'][:100], epoch=epoch)
+            #     logging.info(f"Epoch {epoch+1} - Detailed Evaluation Stats: {detailed_stats}")
+            detailed_stats = run_detailed_evaluation(model, data['val_words'][:100], epoch=epoch)
+            
+            # Calculate completion rate from detailed evaluation
+            successful_words = len([
+                word for word, group in detailed_stats.groupby('word')
+                if group.iloc[-1]['current_state'].count('_') == 0
+            ])
+            completion_rate = successful_words / len(detailed_stats['word'].unique())
+            logging.info(f"Epoch {epoch+1} - Validation Completion Rate: {completion_rate:.4f}")
+            
+            # Comment out API evaluation for now
+            # completion_rate = evaluate_model_with_api(model, epoch=epoch)
+            # logging.info(f"Epoch {epoch+1} - API Completion Rate: {completion_rate:.4f}")
             
             # Early stopping
             if completion_rate > best_completion_rate:
@@ -385,24 +491,29 @@ class ModelHangmanAPI(HangmanAPI):
             vowel_ratio = known_vowels / (len(word_state) // 2)
             word_length = len(word_state) // 2
             
-            # Prepare state dictionary
-            state = {
-                'current_state': word_state[::2],  # Remove spaces
-                'guessed_letters': sorted(list(self.guessed_letters)),
-                'vowel_ratio': vowel_ratio,
-                'remaining_lives': 6 - len([l for l in self.guessed_letters if l not in word_state])
-            }
+            # Convert word state to indices for embedding
+            char_indices = torch.zeros(word_length, dtype=torch.long).to(DEVICE)
+            for i, c in enumerate(word_state[::2]):  # Skip spaces
+                if c == '_':
+                    char_indices[i] = 26  # Mask token
+                else:
+                    char_indices[i] = ord(c) - ord('a')
+            
+            # Create guessed letters tensor
+            guessed = torch.zeros(26, dtype=torch.long).to(DEVICE)
+            for letter in self.guessed_letters:
+                guessed[ord(letter) - ord('a')] = 1
             
             # Get model prediction
             with torch.no_grad():
-                char_indices, guessed, vowel_ratio, lives = prepare_input(state)
-                char_indices = char_indices.unsqueeze(0).to(DEVICE)
-                guessed = guessed.unsqueeze(0).to(DEVICE)
-                length = torch.tensor([len(state['current_state'])], dtype=torch.float32).to(DEVICE)
-                vowel_ratio = vowel_ratio.unsqueeze(0).to(DEVICE)
-                lives = lives.unsqueeze(0).to(DEVICE)
-                
-                predictions = self.model(char_indices, guessed, length, vowel_ratio, lives)
+                predictions = self.model(
+                    char_indices.unsqueeze(0),  # Add batch dimension
+                    guessed.unsqueeze(0),
+                    torch.tensor([word_length], dtype=torch.float32).to(DEVICE),
+                    torch.tensor([vowel_ratio], dtype=torch.float32).to(DEVICE),
+                    torch.tensor([6 - len([l for l in self.guessed_letters if l not in word_state])], 
+                               dtype=torch.float32).to(DEVICE)
+                )
             
             # Get Q-values for all letters
             q_values = {chr(i + ord('a')): p.item() for i, p in enumerate(predictions[0])}
@@ -419,7 +530,7 @@ class ModelHangmanAPI(HangmanAPI):
             self.game_data['chosen_letters'].append(next_letter)
             self.game_data['vowel_ratios'].append(vowel_ratio)
             self.game_data['word_lengths'].append(word_length)
-            self.game_data['remaining_lives'].append(state['remaining_lives'])
+            self.game_data['remaining_lives'].append(6 - len([l for l in self.guessed_letters if l not in word_state]))
             self.game_data['correct_guesses'].append(next_letter in word_state)
             
             return next_letter

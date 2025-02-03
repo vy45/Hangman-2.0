@@ -22,11 +22,21 @@ from collections import Counter
 from multiprocessing import Pool
 import time
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import platform
 
 # Constants
 QUICK_TEST = True
-DEVICE = torch.device("mps" if torch.backends.mps.is_available() else 
-                     ("cuda" if torch.cuda.is_available() else "cpu"))
+
+# Setup device
+def setup_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available() and platform.processor() == 'arm':
+        return torch.device("mps")
+    return torch.device("cpu")
+
+DEVICE = setup_device()
+
 ALPHABET = 'abcdefghijklmnopqrstuvwxyz'
 BATCH_SIZE = 64
 DATA_DIR = 'hangman_data'
@@ -75,6 +85,10 @@ class MaryLSTMModel(nn.Module):
         # Get batch size
         batch_size = word_state.size(0)
         
+        # Convert inputs to long if they aren't already
+        word_state = word_state.long()
+        guessed_letters = guessed_letters.long()
+        
         # LSTM processing
         embedded = self.char_embedding(word_state)  # [batch_size, seq_len, embedding_dim]
         lstm_out, _ = self.lstm(embedded)  # [batch_size, seq_len, hidden_size*2]
@@ -84,28 +98,17 @@ class MaryLSTMModel(nn.Module):
         
         # Create length encoding
         length_encoding = torch.stack([
-            torch.tensor([int(x) for x in format(int(l.item()), '05b')], dtype=torch.float32)
+            self.length_encoding[min(int(l.item()), 32)].to(final_lstm.device)
             for l in word_length
-        ]).to(final_lstm.device)
-
-        # Fix vowel_ratio and remaining_lives dimensions
-        if vowel_ratio.dim() == 1:
-            vowel_ratio = vowel_ratio.unsqueeze(-1)
-        elif vowel_ratio.dim() == 2 and vowel_ratio.size(1) > 1:
-            vowel_ratio = vowel_ratio.squeeze(-1).unsqueeze(-1)
-            
-        if remaining_lives.dim() == 1:
-            remaining_lives = remaining_lives.unsqueeze(-1)
-        elif remaining_lives.dim() == 2 and remaining_lives.size(1) > 1:
-            remaining_lives = remaining_lives.squeeze(-1).unsqueeze(-1)
+        ])
         
         # Concatenate features
         combined_features = torch.cat([
             final_lstm,  # [batch_size, hidden_size*2]
             guessed_letters,  # [batch_size, 26]
             length_encoding,  # [batch_size, 5]
-            vowel_ratio,  # [batch_size, 1]
-            remaining_lives  # [batch_size, 1]
+            vowel_ratio.unsqueeze(-1),  # [batch_size, 1]
+            remaining_lives.unsqueeze(-1)  # [batch_size, 1]
         ], dim=1)
         
         # Apply batch norm if enabled
@@ -572,61 +575,27 @@ def build_ngram_dictionary(words):
     
     return dict(ngram_dict)  # Convert to regular dict
 
-# def simulate_game(word):
-#     """Simulate a single game and generate states"""
-#     states = []
-#     guessed_letters = set()
-#     word_letters = set(word)
-    
-#     while len(guessed_letters) < 26 and len(word_letters - guessed_letters) > 0:
-#         # Current word state
-#         current_state = ''.join([c if c in guessed_letters else '_' for c in word])
-        
-#         # Calculate target distribution (only unguessed correct letters)
-#         target_dist = {l: 0.0 for l in ALPHABET}
-#         remaining_letters = word_letters - guessed_letters
-#         for letter in remaining_letters:
-#             target_dist[letter] = 1.0
-        
-#         # Normalize distribution
-#         total = sum(target_dist.values())
-#         if total > 0:
-#             target_dist = {k: v/total for k, v in target_dist.items()}
-        
-#         # Store state
-#         states.append({
-#             'current_state': current_state,
-#             'guessed_letters': sorted(list(guessed_letters)),
-#             'target_distribution': target_dist
-#         })
-        
-#         # Simulate next guess
-#         if random.random() < SIMULATION_CORRECT_GUESS_PROB and remaining_letters:
-#             next_letter = random.choice(list(remaining_letters))
-#         else:
-#             available_letters = set(ALPHABET) - guessed_letters
-#             next_letter = random.choice(list(available_letters))
-        
-#         guessed_letters.add(next_letter)
-    
-#     return states
-
 def prepare_input(state):
-    """Prepare input tensors for model"""
-    char_indices = torch.tensor([
-        ALPHABET.index(c) if c in ALPHABET else 26 
-        for c in state['current_state']
-    ], dtype=torch.long)
+    """Convert state dict to tensors"""
+    # Create character indices tensor
+    char_indices = torch.zeros(27, dtype=torch.float32)
+    for i, c in enumerate(state['current_state']):
+        if c != '_':
+            char_indices[ord(c) - ord('a')] = 1
+    char_indices[-1] = state['current_state'].count('_') / len(state['current_state'])
     
-    guessed = torch.zeros(26)
+    # Create guessed letters tensor
+    guessed = torch.zeros(26, dtype=torch.float32)
     for letter in state['guessed_letters']:
-        if letter in ALPHABET:
-            guessed[ALPHABET.index(letter)] = 1
-            
-    vowel_ratio = torch.tensor([state['vowel_ratio']], dtype=torch.float32)
-    remaining_lives = torch.tensor([state['remaining_lives']], dtype=torch.float32) / 6.0  # Scale to [0,1]
+        guessed[ord(letter) - ord('a')] = 1
     
-    return char_indices, guessed, vowel_ratio, remaining_lives
+    # Create vowel ratio tensor
+    vowel_ratio = torch.tensor(state['vowel_ratio'], dtype=torch.float32)
+    
+    # Create remaining lives tensor
+    lives = torch.tensor(state['remaining_lives'], dtype=torch.float32)
+    
+    return char_indices.to(DEVICE), guessed.to(DEVICE), vowel_ratio.to(DEVICE), lives.to(DEVICE)
 
 def save_data(train_states, val_states, val_words):
     """Save datasets with timestamp"""
@@ -688,8 +657,6 @@ def setup_logging():
     logging.info("Logging setup complete. Log file: " + str(log_file))
     return log_file
 
-
-
 def count_missing_letters(state):
     """Count number of missing letter positions in a state"""
     return state['current_state'].count('_')
@@ -722,45 +689,48 @@ def prepare_curriculum_batches(train_states, epoch, max_missing=None):
     return batches
 
 def prepare_padded_batch(batch):
-    """Prepare a batch with padding to max length in batch"""
-    # Find max length in batch
+    """Convert batch of states to padded tensors"""
+    # Get max length in batch
     max_len = max(len(state['current_state']) for state in batch)
     
-    # Prepare tensors
-    word_states = []
-    guessed_letters = []
-    lengths = []
-    vowel_ratios = []
-    remaining_lives = []
-    targets = []
+    # Initialize tensors
+    batch_size = len(batch)
+    word_states = torch.zeros(batch_size, 27, dtype=torch.long).to(DEVICE)  # Changed to long
+    guessed_letters = torch.zeros(batch_size, 26, dtype=torch.long).to(DEVICE)  # Changed to long
+    lengths = torch.zeros(batch_size, dtype=torch.float32).to(DEVICE)
+    vowel_ratios = torch.zeros(batch_size, dtype=torch.float32).to(DEVICE)
+    remaining_lives = torch.zeros(batch_size, dtype=torch.float32).to(DEVICE)
+    targets = torch.zeros(batch_size, 26, dtype=torch.float32).to(DEVICE)
     
-    for state in batch:
-        # Get basic tensors
-        char_indices, guessed, vowel_ratio, lives = prepare_input(state)
-        current_len = len(char_indices)
+    # Fill tensors
+    for i, state in enumerate(batch):
+        # Word state
+        for j, c in enumerate(state['current_state']):
+            if c != '_':
+                word_states[i, ord(c) - ord('a')] = 1
+        word_states[i, -1] = int(state['current_state'].count('_') / len(state['current_state']) * 100)  # Convert ratio to int
         
-        # Pad char_indices if needed (use 27 for padding)
-        if current_len < max_len:
-            padding = torch.full((max_len - current_len,), 27, dtype=torch.long)
-            char_indices = torch.cat([char_indices, padding])
+        # Guessed letters
+        for letter in state['guessed_letters']:
+            guessed_letters[i, ord(letter) - ord('a')] = 1
+            
+        # Other features
+        lengths[i] = len(state['current_state'])
+        vowel_ratios[i] = state['vowel_ratio']
+        remaining_lives[i] = state['remaining_lives']
         
-        word_states.append(char_indices)
-        guessed_letters.append(guessed)
-        lengths.append(len(state['current_state']))  # Original length before padding
-        vowel_ratios.append(vowel_ratio)
-        remaining_lives.append(lives)
-        targets.append(torch.tensor(
-            list(state['target_distribution'].values()), 
-            dtype=torch.float32
-        ))
-    
-    # Stack tensors
-    word_states = torch.stack(word_states).to(DEVICE)
-    guessed_letters = torch.stack(guessed_letters).to(DEVICE)
-    lengths = torch.tensor(lengths).to(DEVICE)
-    vowel_ratios = torch.stack(vowel_ratios).to(DEVICE)
-    remaining_lives = torch.stack(remaining_lives).to(DEVICE)
-    targets = torch.stack(targets).to(DEVICE)
+        # Target distribution
+        if 'target_distribution' in state:
+            for letter, prob in state['target_distribution'].items():
+                targets[i, ord(letter) - ord('a')] = prob
+        else:
+            # If no target distribution, create one from unguessed correct letters
+            word_letters = set(state['current_state']) - {'_'}
+            unguessed_correct = word_letters - set(state['guessed_letters'])
+            if unguessed_correct:
+                prob = 1.0 / len(unguessed_correct)
+                for letter in unguessed_correct:
+                    targets[i, ord(letter) - ord('a')] = prob
     
     return word_states, guessed_letters, lengths, vowel_ratios, remaining_lives, targets
 
