@@ -27,24 +27,28 @@ import string
 
 def setup_logging():
     """Setup logging configuration"""
-    if not hasattr(setup_logging, "initialized"):  # Only setup once
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        log_dir = Path('logs')
-        log_dir.mkdir(exist_ok=True)
-        log_file = log_dir / f'mary_hangman_v2_{timestamp}.log'
-        
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler(sys.stdout)
-            ]
-        )
-        setup_logging.initialized = True
-        logging.info("Logging setup complete. Log file: " + str(log_file))
-        return log_file
-    return None
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_dir = Path('logs')
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / f'mary_hangman_v2_{timestamp}.log'
+    
+    # Remove any existing handlers to avoid duplicate logging
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,  # Changed from DEBUG to INFO to reduce noise
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    logging.info("Logging setup complete")
+    logging.info(f"Log file: {log_file}")
+    return log_file
 
 # Constants
 QUICK_TEST = False
@@ -62,14 +66,6 @@ MIN_NGRAM_LENGTH = 3
 MAX_NGRAM_LENGTH = 5
 EPOCHS = 3 if QUICK_TEST else 100
 COMPLETION_EVAL_WORDS = 1000 if QUICK_TEST else 10000
-
-# Log device info after logging is set up
-logging.info(f"Using device: {DEVICE}")
-if DEVICE.type == "mps":
-    logging.info("Running on Apple Silicon")
-    # Enable memory efficient attention if using transformers
-    if hasattr(torch.backends, "mps") and hasattr(torch.backends.mps, "enable_mem_efficient_sdp"):
-        torch.backends.mps.enable_mem_efficient_sdp(True)
 
 class MaryLSTMModel(nn.Module):
     def __init__(self, hidden_dim=128, embedding_dim=8, dropout_rate=0.4, use_batch_norm=False):
@@ -1204,6 +1200,12 @@ def validate_states(states, num_samples=5):
     
     if not states:
         raise ValueError("States list is empty")
+        
+    logging.info(f"Total states to validate: {len(states)}")
+    
+    # Print first state for debugging
+    logging.info(f"Example state keys: {states[0].keys()}")
+    logging.info(f"Example state values: {states[0]}")
     
     # Sample random states
     sample_states = random.sample(states, min(num_samples, len(states)))
@@ -1260,9 +1262,16 @@ def validate_states(states, num_samples=5):
     return True
 
 def main():
-    # Setup logging first
+    # Setup logging first thing in main()
     log_file = setup_logging()
     
+    # Now log device info after logging is set up
+    logging.info(f"Using device: {DEVICE}")
+    if DEVICE.type == "mps":
+        logging.info("Running on Apple Silicon")
+        if hasattr(torch.backends, "mps") and hasattr(torch.backends.mps, "enable_mem_efficient_sdp"):
+            torch.backends.mps.enable_mem_efficient_sdp(True)
+
     parser = argparse.ArgumentParser(description='Train Mary Hangman Model')
     parser.add_argument('--force-new-data', action='store_true', 
                        help='Force generation of new dataset even if one exists')
@@ -1280,21 +1289,30 @@ def main():
             logging.info(f"{'Forcing new dataset generation...' if args.force_new_data else 'No existing dataset found. Generating new dataset...'}")
             training_words, val_words = load_and_preprocess_words()
             
-            # # Build n-gram dictionary
-            # with open('words_250000_train.txt', 'r') as f:
-            #     words = [w.strip().lower() for w in f.readlines()]
-            # # ngram_dict = build_ngram_dictionary(words)
             ngram_dict = None
-
-            # Generate datasets
-            train_states = generate_dataset(training_words, ngram_dict, num_games_per_word=5, is_validation=False)
-            val_states = generate_dataset(val_words, ngram_dict, num_games_per_word=5, is_validation=True)
             
+            # Add logging to track dataset generation
+            logging.info(f"Generating training states for {len(training_words)} words...")
+            train_states = generate_dataset(training_words, ngram_dict, num_games_per_word=5, is_validation=False)
+            logging.info(f"Generated {len(train_states)} training states")
+            
+            logging.info(f"Generating validation states for {len(val_words)} words...")
+            val_states = generate_dataset(val_words, ngram_dict, num_games_per_word=5, is_validation=True)
+            logging.info(f"Generated {len(val_states)} validation states")
+            
+            # Verify states before saving
+            if not train_states or not val_states:
+                raise ValueError("Generated states are empty!")
+                
+            logging.info("Saving generated datasets...")
             save_data(train_states, val_states, val_words)
         
-        # Validate states before training
+        # Add more validation logging
+        logging.info(f"Validating {len(train_states)} training states...")
         validate_states(train_states)
+        logging.info(f"Validating {len(val_states)} validation states...")
         validate_states(val_states)
+        logging.info("State validation complete")
 
         if args.evaluate:
             evaluate_saved_model(args.evaluate)
