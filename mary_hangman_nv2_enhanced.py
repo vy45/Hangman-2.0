@@ -12,7 +12,7 @@ from pathlib import Path
 from tqdm import tqdm
 from mary_hangman_nv2 import (
     MaryLSTMModel, prepare_input, DEVICE, 
-    prepare_length_batches, prepare_padded_batch
+    prepare_curriculum_batches, prepare_padded_batch, prepare_length_batches
 )
 import torch.nn.functional as F
 import os
@@ -21,6 +21,7 @@ import traceback
 import platform
 from multiprocessing import Pool, cpu_count
 from functools import partial
+import random
 
 # Setup device
 def setup_device():
@@ -213,7 +214,7 @@ def evaluate_validation_states(model, val_states, epoch):
     predictions_data = []
     nan_val_batches = 0
     
-    # Prepare validation batches
+    # Prepare validation batches (no curriculum needed)
     with Timer("Validation Batch Preparation"):
         val_batches = prepare_length_batches(val_states)
         logging.info(f"Number of validation batches: {len(val_batches)}")
@@ -531,27 +532,34 @@ def train_model():
     max_consecutive_nan_val = 3  # Maximum allowed consecutive NaN validation losses
     
     # Curriculum learning parameters
-    curriculum_epochs = 5  # Number of epochs per difficulty level
-    max_difficulty = max(state['current_state'].count('_') for state in all_states)
-    curriculum_steps = range(max_difficulty)
+    max_missing_letters = 6#max(state['current_state'].count('_') for state in all_states)
+    current_max_missing = 1  # Start with 1 missing letter
     
-    # Training loop with curriculum
-    logging.info("Starting training loop with curriculum learning")
-    current_curriculum = 0
+    # Initial batch preparation
+    logging.info("Preparing initial batches...")
+    with Timer("Initial Batch Preparation"):
+        all_batches = prepare_curriculum_batches(all_states, max_missing=current_max_missing)
+        logging.info(f"Number of batches: {len(all_batches)}")
     
+    # Training loop
     for epoch in range(num_epochs):
-        # Update curriculum step every curriculum_epochs
-        if epoch > 0 and epoch % curriculum_epochs == 0:
-            current_curriculum = min(current_curriculum + 1, max_difficulty - 1)
-            logging.info(f"Advancing curriculum to step {current_curriculum}")
+        # Update curriculum every epoch until we reach full dataset
+        if epoch > 0 and current_max_missing < max_missing_letters:
+            current_max_missing += 1
+            logging.info(f"Advancing curriculum: max missing letters = {current_max_missing}")
             
             # Prepare new batches for current curriculum
             with Timer("Curriculum Batch Preparation"):
-                all_batches = prepare_length_batches(
-                    all_states, 
-                    curriculum_step=current_curriculum
-                )
-                logging.info(f"Number of batches in curriculum: {len(all_batches)}")
+                if current_max_missing >= max_missing_letters:
+                    # Use all states without curriculum
+                    all_batches = prepare_length_batches(all_states)
+                    logging.info("Using full dataset (curriculum complete)")
+                else:
+                    all_batches = prepare_curriculum_batches(
+                        all_states, 
+                        max_missing=current_max_missing
+                    )
+                logging.info(f"Number of batches: {len(all_batches)}")
         
         with Timer(f"Epoch {epoch + 1}"):
             model.train()
